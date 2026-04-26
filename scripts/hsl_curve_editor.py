@@ -1,299 +1,427 @@
 """
-交互式 HLS 曲线编辑器
+交互式 Oklch 状态曲线编辑器
 
 用法：
-    python scripts/hsl_curve_editor.py [图片路径]
+    python scripts/hsl_curve_editor.py [图片路径] [--curves 曲线文件]
 
 操作：
     - 左键拖拽：移动控制点，实时更新预览
-    - 左键点击空白处：不操作
-    - 右键点击控制点：重置该控制点到默认值（直线位置）
+    - 右键点击控制点：重置该控制点到初始值
+    - S / Ctrl+S：导出当前 Lt/Ct/ht 控制点到 JSON
+    - Enter：执行一次全分辨率重建并显示结果
 """
 
-import sys
+import argparse
+import json
 import os
 import time
-import numpy as np
-from scipy.interpolate import CubicSpline
+
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
-from skimage import io, color
-from skimage.util import img_as_float, img_as_ubyte
-import colour
+import numpy as np
+from scipy.interpolate import PchipInterpolator
 
-# ── 加载图像 ────────────────────────────────────────────────────────────────
-
-def load_image(image_path: str):
-    original = io.imread(image_path)
-    image_float = img_as_float(original)
-    rgb_float = image_float[:, :, :3]
-    alpha_float = image_float[:, :, 3] if original.shape[2] == 4 else np.ones(rgb_float.shape[:2])
-    valid_mask = alpha_float > 0.5
-    luma_float = color.rgb2gray(rgb_float)
-    luma_uint8 = np.clip(np.round(luma_float * 255), 0, 255).astype(np.uint8)
-    return rgb_float, luma_uint8, valid_mask
-
-
-def build_base_lut(luma_uint8, rgb_float, valid_mask):
-    """构建基础亮度→RGB LUT（归一化浮点，NaN 表示未出现的灰度值）。"""
-    valid_luma = luma_uint8[valid_mask]
-    valid_rgb = rgb_float[valid_mask]
-    histogram = np.bincount(valid_luma, minlength=256)
-    rgb_sums = np.stack(
-        [np.bincount(valid_luma, weights=ch, minlength=256) for ch in valid_rgb.T], axis=1
-    )
-    safe_counts = np.maximum(histogram, 1)[:, np.newaxis]
-    lut_rgb = rgb_sums / safe_counts
-    lut_rgb[histogram == 0] = np.nan
-    return lut_rgb  # (256, 3) float, NaN for absent luma values
+from luma_color_map import (
+    DITHER_STRENGTH,
+    STATE_CURVE_CTRL_POINTS,
+    build_oklch_curve_model,
+    build_state_curve_set,
+    compress_oklch_chroma_to_srgb,
+    evaluate_reconstruction,
+    load_image,
+    load_state_curve_overrides,
+    plot_comparison,
+    prepare_control_points,
+    reconstruct_from_state_curves,
+)
 
 
-# ── Spline 曲线工具 ──────────────────────────────────────────────────────────
-
-N_CTRL = 10  # 每条曲线的控制点数
-X_CTRL = np.linspace(0, 1, N_CTRL)  # 控制点 x 位置（均匀分布于 [0,1]）
-X_256 = np.linspace(0, 1, 256)      # 输出到 256 个灰度值的采样点
-
-
-def ctrl_to_curve(y_ctrl: np.ndarray) -> np.ndarray:
-    """给定 N_CTRL 个控制点 y 值，用 Cubic Spline 插值到 256 点。"""
-    cs = CubicSpline(X_CTRL, y_ctrl, bc_type="not-a-knot", extrapolate=True)
-    return np.clip(cs(X_256), 0.0, 1.0)
+PREVIEW_SCALE = 0.25
+PREVIEW_LUT_SIZE = 512
+CURVE_LINE_SAMPLES = 512
+CURVE_X_DENSE = np.linspace(0.0, 1.0, CURVE_LINE_SAMPLES)
 
 
-def apply_hsl_curves(lut_rgb, h_curve, l_curve, s_curve):
-    """
-    将 HLS 调整曲线应用于基础 RGB LUT，返回调整后的 RGB LUT。
-
-    曲线的含义：输出值 = curve[原始值 × 255]（映射关系，非偏移量）。
-    NaN 条目保持为 0（透明区域不显示颜色）。
-    """
-    lut_safe = np.nan_to_num(lut_rgb, nan=0.0)  # (256, 3)
-    lut_hsl = colour.RGB_to_HSL(lut_safe)       # (256, 3): H[0,1], S[0,1], L[0,1]
-
-    idx = np.arange(256)
-
-    # 分别重映射 H / S / L
-    # h_curve: 输入 H → 输出 H（都在 [0,1]，代表 0-360°）
-    h_in = lut_hsl[:, 0]                         # 原始 H [0,1]
-    h_idx = np.clip(np.round(h_in * 255).astype(int), 0, 255)
-    lut_hsl[:, 0] = h_curve[h_idx]
-
-    l_in = lut_hsl[:, 2]
-    l_idx = np.clip(np.round(l_in * 255).astype(int), 0, 255)
-    lut_hsl[:, 2] = l_curve[l_idx]
-
-    s_in = lut_hsl[:, 1]
-    s_idx = np.clip(np.round(s_in * 255).astype(int), 0, 255)
-    lut_hsl[:, 1] = s_curve[s_idx]
-
-    adjusted_rgb = colour.HSL_to_RGB(lut_hsl)
-    adjusted_rgb = np.clip(adjusted_rgb, 0.0, 1.0)
-    # 恢复 NaN 条目
-    absent = np.isnan(lut_rgb[:, 0])
-    adjusted_rgb[absent] = 0.0
-    return adjusted_rgb  # (256, 3)
+def _evaluate_hue_curve(hue_u_interp: PchipInterpolator, hue_v_interp: PchipInterpolator, x_values):
+    """对 hue 状态曲线求值，返回 0-360°。"""
+    hue_u = hue_u_interp(x_values)
+    hue_v = hue_v_interp(x_values)
+    norm = np.hypot(hue_u, hue_v)
+    safe_norm = np.where(norm < 1e-8, 1.0, norm)
+    return (np.degrees(np.arctan2(hue_v / safe_norm, hue_u / safe_norm)) + 360.0) % 360.0
 
 
-def recolor(luma_uint8, lut_rgb_adjusted, valid_mask):
-    """用调整后的 LUT 对图像重新上色，返回 uint8 RGB。"""
-    recolored = lut_rgb_adjusted[luma_uint8]
-    recolored_uint8 = img_as_ubyte(np.clip(recolored, 0.0, 1.0))
-    out = np.zeros((*valid_mask.shape, 3), dtype=np.uint8)
-    out[valid_mask] = recolored_uint8[valid_mask]
-    return out
-
-
-def recolor_fast(luma_uint8_small, lut_uint8, invalid_mask_small, out_buf):
-    """预览专用：LUT 为 uint8，复用预分配的 out_buf 避免每帧堆分配。
-
-    np.take 支持 out= 参数，直接写入已有内存，比每次新建数组快 ~17%。
-    """
-    np.take(lut_uint8, luma_uint8_small, axis=0, out=out_buf)
+def recolor_fast(y_index_small, lut_uint8, invalid_mask_small, out_buf):
+    """预览专用：复用缓冲区做 LUT 查表。"""
+    np.take(lut_uint8, y_index_small, axis=0, out=out_buf)
     out_buf[invalid_mask_small] = 0
 
 
-# ── 交互编辑器 ───────────────────────────────────────────────────────────────
-
-class HslCurveEditor:
-    CURVE_CFG = [
-        {"name": "Hue",        "color": "orchid",      "ylim": (0, 1), "ylabel": "Output H (0=0°, 1=360°)"},
-        {"name": "Lightness",  "color": "gold",        "ylim": (0, 1), "ylabel": "Output L"},
-        {"name": "Saturation", "color": "deepskyblue", "ylim": (0, 1), "ylabel": "Output S"},
-    ]
-
-    def __init__(self, rgb_float, luma_uint8, valid_mask, lut_rgb):
+class OklchCurveEditor:
+    def __init__(
+        self,
+        image_path: str,
+        rgb_float: np.ndarray,
+        oklch_float: np.ndarray,
+        valid_mask: np.ndarray,
+        base_model,
+        *,
+        initial_curve_overrides: dict | None = None,
+        dither_strength: float = DITHER_STRENGTH,
+        curve_output_path: str | None = None,
+    ):
+        self.image_path = image_path
         self.rgb_float = rgb_float
-        self.luma_uint8 = luma_uint8
+        self.oklch_float = oklch_float
         self.valid_mask = valid_mask
-        self.lut_rgb = lut_rgb
+        self.base_model = base_model
+        self.dither_strength = dither_strength
+        self.curve_output_path = curve_output_path or self._default_curve_output_path()
 
-        # 预览用缩小版（25% 面积，即 50% 线性尺寸）
-        PREVIEW_SCALE = 0.25
-        h, w = luma_uint8.shape
-        ph, pw = max(1, int(h * PREVIEW_SCALE)), max(1, int(w * PREVIEW_SCALE))
-        # 用切片降采样（速度快，无需额外库）
-        sy = max(1, h // ph)
-        sx = max(1, w // pw)
-        self.luma_small = luma_uint8[::sy, ::sx]
-        self.mask_small = valid_mask[::sy, ::sx]
-        # 预分配预览输出缓冲区（H×W×3 uint8），每帧复用，避免堆分配
-        self._preview_buf = np.empty((*self.luma_small.shape, 3), dtype=np.uint8)
-        # 预计算反模，避免每帧重新计算 ~mask
-        self._invalid_mask = ~self.mask_small
-
-        # 默认控制点：恒等映射（对角线）
-        self.ctrl_y = [np.copy(X_CTRL) for _ in range(3)]
-        self.curves = [ctrl_to_curve(cy) for cy in self.ctrl_y]
-
-        self._drag_state = None  # (curve_idx, point_idx)
+        self._build_preview_inputs()
+        self._initialize_controls(initial_curve_overrides or {})
+        self._drag_state = None
+        self._last_state_curves = None
 
         self._build_ui()
         self._render_preview()
         self._connect_events()
 
+    def _default_curve_output_path(self) -> str:
+        stem, _ = os.path.splitext(self.image_path)
+        return f"{stem}_state_curves.json"
+
+    def _build_preview_inputs(self):
+        height, width = self.oklch_float.shape[:2]
+        preview_height = max(1, int(height * PREVIEW_SCALE))
+        preview_width = max(1, int(width * PREVIEW_SCALE))
+        step_y = max(1, height // preview_height)
+        step_x = max(1, width // preview_width)
+
+        self.oklch_small = self.oklch_float[::step_y, ::step_x]
+        self.mask_small = self.valid_mask[::step_y, ::step_x]
+        self.y_small = self.oklch_small[:, :, 0]
+        self.y_small_index = np.clip(
+            np.round(self.y_small * (PREVIEW_LUT_SIZE - 1)), 0, PREVIEW_LUT_SIZE - 1
+        ).astype(np.int32)
+        self._preview_buf = np.empty((*self.y_small.shape, 3), dtype=np.uint8)
+        self._invalid_mask_small = ~self.mask_small
+
+    def _sample_initial_curves(self, initial_curve_overrides: dict):
+        default_lightness_x = np.linspace(0.0, 1.0, STATE_CURVE_CTRL_POINTS)
+        default_lightness_points = prepare_control_points(
+            initial_curve_overrides.get("lightness_control_points"),
+            default_lightness_x,
+            default_lightness_x,
+            clip_min=0.0,
+            clip_max=1.0,
+        )
+        default_chroma_points = prepare_control_points(
+            initial_curve_overrides.get("chroma_control_points"),
+            self.base_model.key_y,
+            self.base_model.key_c,
+            clip_min=0.0,
+        )
+        default_hue_points = prepare_control_points(
+            initial_curve_overrides.get("hue_control_points"),
+            self.base_model.key_y,
+            self.base_model.key_h,
+            wrap_degrees=True,
+        )
+        return default_lightness_points, default_chroma_points, default_hue_points
+
+    def _sample_base_model(self, x_values):
+        chroma = np.clip(self.base_model.c_interp(x_values), 0.0, None)
+        hue = _evaluate_hue_curve(self.base_model.u_interp, self.base_model.v_interp, x_values)
+        return chroma, hue
+
+    def _initialize_controls(self, initial_curve_overrides: dict):
+        lightness_points, chroma_points, hue_points = self._sample_initial_curves(initial_curve_overrides)
+        self.ctrl_x = [lightness_points[:, 0], chroma_points[:, 0], hue_points[:, 0]]
+        self.ctrl_y = [lightness_points[:, 1], chroma_points[:, 1], hue_points[:, 1]]
+        self.default_ctrl_y = [np.copy(values) for values in self.ctrl_y]
+
+        base_chroma_max = max(np.max(self.base_model.key_c), np.max(chroma_points[:, 1]), 1e-3)
+        self.chroma_ylim = (0.0, max(0.35, float(base_chroma_max) * 1.25))
+
+        self.curve_cfg = [
+            {
+                "name": "Lightness Transfer Lt(y)",
+                "color": "gold",
+                "ylim": (0.0, 1.0),
+                "ylabel": "Output Lightness L'",
+                "xlabel": "Input Lightness L0",
+            },
+            {
+                "name": "Chroma State Ct(L')",
+                "color": "deepskyblue",
+                "ylim": self.chroma_ylim,
+                "ylabel": "Output Chroma C'",
+                "xlabel": "Output Lightness L'",
+            },
+            {
+                "name": "Hue State ht(L')",
+                "color": "tomato",
+                "ylim": (0.0, 360.0),
+                "ylabel": "Output Hue h' (deg)",
+                "xlabel": "Output Lightness L'",
+            },
+        ]
+
+    def _current_control_point_payload(self) -> dict:
+        return {
+            "lightness_control_points": np.column_stack([self.ctrl_x[0], self.ctrl_y[0]]),
+            "chroma_control_points": np.column_stack([self.ctrl_x[1], self.ctrl_y[1]]),
+            "hue_control_points": np.column_stack([self.ctrl_x[2], self.ctrl_y[2]]),
+        }
+
+    def _build_state_curves(self):
+        return build_state_curve_set(self.base_model, **self._current_control_point_payload())
+
+    def _build_preview_lut(self, state_curves):
+        preview_x = np.linspace(0.0, 1.0, PREVIEW_LUT_SIZE)
+        lightness = np.clip(state_curves.lightness_interp(preview_x), 0.0, 1.0)
+        chroma = np.clip(state_curves.chroma_interp(lightness), 0.0, None)
+        hue = _evaluate_hue_curve(state_curves.hue_u_interp, state_curves.hue_v_interp, lightness)
+
+        preview_oklch = np.column_stack([lightness, chroma, hue])
+        _, preview_rgb, gamut_pixels = compress_oklch_chroma_to_srgb(preview_oklch)
+        preview_lut_uint8 = np.clip(np.round(preview_rgb * 255.0), 0, 255).astype(np.uint8)
+        return preview_lut_uint8, gamut_pixels
+
+    def _sample_curve_lines(self, state_curves):
+        lightness_line = np.clip(state_curves.lightness_interp(CURVE_X_DENSE), 0.0, 1.0)
+        chroma_line = np.clip(state_curves.chroma_interp(CURVE_X_DENSE), 0.0, None)
+        hue_line = _evaluate_hue_curve(state_curves.hue_u_interp, state_curves.hue_v_interp, CURVE_X_DENSE)
+        return [lightness_line, chroma_line, hue_line]
+
     def _build_ui(self):
         self.fig = plt.figure(figsize=(16, 9))
-        self.fig.canvas.manager.set_window_title("HLS Curve Editor")
+        self.fig.canvas.manager.set_window_title("Oklch State Curve Editor")
 
-        # 左侧 3 个曲线编辑子图，右侧 1 个预览图
-        gs = self.fig.add_gridspec(3, 2, width_ratios=[1, 1.2], hspace=0.4, wspace=0.35,
-                                   left=0.07, right=0.97, top=0.95, bottom=0.07)
-        self.curve_axes = [self.fig.add_subplot(gs[i, 0]) for i in range(3)]
-        self.preview_ax = self.fig.add_subplot(gs[:, 1])
+        grid = self.fig.add_gridspec(
+            3,
+            2,
+            width_ratios=[1, 1.2],
+            hspace=0.4,
+            wspace=0.35,
+            left=0.07,
+            right=0.97,
+            top=0.95,
+            bottom=0.08,
+        )
+        self.curve_axes = [self.fig.add_subplot(grid[i, 0]) for i in range(3)]
+        self.preview_ax = self.fig.add_subplot(grid[:, 1])
+
+        self.fig.text(
+            0.07,
+            0.02,
+            "Left drag: move point   Right click: reset point   S: save curves JSON   Enter: full-resolution render",
+            fontsize=9,
+        )
 
         self.curve_lines = []
         self.ctrl_scatters = []
+        for index, (axis, cfg, ctrl_values) in enumerate(zip(self.curve_axes, self.curve_cfg, self.ctrl_y)):
+            axis.set_xlim(0.0, 1.0)
+            axis.set_ylim(*cfg["ylim"])
+            axis.set_title(cfg["name"], fontsize=10)
+            axis.set_ylabel(cfg["ylabel"], fontsize=8)
+            axis.set_xlabel(cfg["xlabel"], fontsize=8)
+            axis.grid(True, alpha=0.3)
 
-        for i, (ax, cfg) in enumerate(zip(self.curve_axes, self.CURVE_CFG)):
-            ax.set_xlim(0, 1)
-            ax.set_ylim(*cfg["ylim"])
-            ax.set_title(cfg["name"], fontsize=10)
-            ax.set_ylabel(cfg["ylabel"], fontsize=8)
-            ax.grid(True, alpha=0.3)
-
-            line, = ax.plot(X_256, self.curves[i], color=cfg["color"], lw=2)
-            scat = ax.scatter(X_CTRL, self.ctrl_y[i], s=60, color="white",
-                              edgecolors=cfg["color"], zorder=5, picker=True)
-            # 对角参考线
-            ax.plot([0, 1], [0, 1], color="gray", lw=0.8, linestyle="--", alpha=0.5)
+            line, = axis.plot(CURVE_X_DENSE, np.zeros_like(CURVE_X_DENSE), color=cfg["color"], lw=2)
+            scatter = axis.scatter(
+                self.ctrl_x[index],
+                ctrl_values,
+                s=55 if ctrl_values.size <= STATE_CURVE_CTRL_POINTS else 14,
+                color="white",
+                edgecolors=cfg["color"],
+                zorder=5,
+                picker=True,
+            )
+            if index == 0:
+                axis.plot([0, 1], [0, 1], color="gray", lw=0.8, linestyle="--", alpha=0.5)
 
             self.curve_lines.append(line)
-            self.ctrl_scatters.append(scat)
+            self.ctrl_scatters.append(scatter)
 
         self.preview_ax.set_title("Preview", fontsize=11)
         self.preview_ax.axis("off")
-        self.preview_img = self.preview_ax.imshow(
-            np.zeros((*self.valid_mask.shape, 3), dtype=np.uint8)
-        )
+        self.preview_img = self.preview_ax.imshow(np.zeros((*self.y_small.shape, 3), dtype=np.uint8))
 
     def _render_preview(self):
-        h_curve, l_curve, s_curve = self.curves
-
-        t0 = time.perf_counter()
-        lut_adjusted_float = apply_hsl_curves(self.lut_rgb, h_curve, l_curve, s_curve)
-        # 量化为 uint8 LUT（256×3），后续查表无需类型转换
-        lut_uint8 = np.clip(np.round(lut_adjusted_float * 255), 0, 255).astype(np.uint8)
-        t1 = time.perf_counter()
-        recolor_fast(self.luma_small, lut_uint8, self._invalid_mask, self._preview_buf)
-        t2 = time.perf_counter()
+        start = time.perf_counter()
+        state_curves = self._build_state_curves()
+        line_values = self._sample_curve_lines(state_curves)
+        lut_uint8, gamut_pixels = self._build_preview_lut(state_curves)
+        mid = time.perf_counter()
+        recolor_fast(self.y_small_index, lut_uint8, self._invalid_mask_small, self._preview_buf)
+        recolor_done = time.perf_counter()
         self.preview_img.set_data(self._preview_buf)
-        self.fig.canvas.draw_idle()
-        t3 = time.perf_counter()
 
+        for line, values in zip(self.curve_lines, line_values):
+            line.set_ydata(values)
+        self.fig.canvas.draw_idle()
+        draw_done = time.perf_counter()
+
+        self._last_state_curves = state_curves
         print(
-            f"apply+quantize={1000*(t1-t0):.1f}ms  "
-            f"recolor={1000*(t2-t1):.1f}ms  "
-            f"draw={1000*(t3-t2):.1f}ms  "
-            f"total={1000*(t3-t0):.1f}ms"
+            f"state+lut={1000 * (mid - start):.1f}ms  "
+            f"recolor={1000 * (recolor_done - mid):.1f}ms  "
+            f"draw={1000 * (draw_done - recolor_done):.1f}ms  "
+            f"gamut={gamut_pixels}"
         )
 
-    def _update_curve(self, curve_idx):
-        cy = self.ctrl_y[curve_idx]
-        self.curves[curve_idx] = ctrl_to_curve(cy)
-        self.curve_lines[curve_idx].set_ydata(self.curves[curve_idx])
-        # 更新散点位置
-        offsets = np.column_stack([X_CTRL, cy])
+    def _update_control_scatter(self, curve_idx):
+        offsets = np.column_stack([self.ctrl_x[curve_idx], self.ctrl_y[curve_idx]])
         self.ctrl_scatters[curve_idx].set_offsets(offsets)
+
+    def _save_curves(self):
+        payload = {
+            "lightness": np.column_stack([self.ctrl_x[0], self.ctrl_y[0]]).tolist(),
+            "chroma": np.column_stack([self.ctrl_x[1], self.ctrl_y[1]]).tolist(),
+            "hue": np.column_stack([self.ctrl_x[2], self.ctrl_y[2]]).tolist(),
+        }
+        with open(self.curve_output_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+        print(f"Saved curves: {self.curve_output_path}")
+
+    def _render_full_resolution(self):
+        state_curves = self._last_state_curves or self._build_state_curves()
+        recolored_rgb_float, _, y_eval, gamut_pixels = reconstruct_from_state_curves(
+            self.oklch_float,
+            self.valid_mask,
+            state_curves,
+            dither_strength=self.dither_strength,
+        )
+        recolored_rgb_int, psnr, delta_e_image, delta_e_stats = evaluate_reconstruction(
+            self.rgb_float,
+            recolored_rgb_float,
+            self.valid_mask,
+        )
+
+        print(f"Full-resolution gamut-compressed pixels: {gamut_pixels}")
+        print(f"Full-resolution PSNR: {psnr:.2f} dB")
+        for key, value in delta_e_stats.items():
+            print(f"Delta E 2000 ({key.replace('_', ' ').title()}): {value:.2f}")
+
+        plot_comparison(self.rgb_float, y_eval, recolored_rgb_int, self.valid_mask, psnr, delta_e_image)
+        plt.show(block=False)
 
     def _connect_events(self):
         self.fig.canvas.mpl_connect("button_press_event", self._on_press)
         self.fig.canvas.mpl_connect("button_release_event", self._on_release)
         self.fig.canvas.mpl_connect("motion_notify_event", self._on_motion)
+        self.fig.canvas.mpl_connect("key_press_event", self._on_key_press)
 
     def _hit_test(self, event):
-        """返回被点击的 (curve_idx, point_idx) 或 None。"""
-        for i, ax in enumerate(self.curve_axes):
-            if event.inaxes is not ax:
+        for curve_idx, axis in enumerate(self.curve_axes):
+            if event.inaxes is not axis or event.xdata is None or event.ydata is None:
                 continue
-            if event.xdata is None or event.ydata is None:
-                continue
-            # 转换为 axes 坐标系下的像素距离
-            ax_bbox = ax.get_window_extent()
-            ax_width = ax_bbox.width   # pixels
-            ax_height = ax_bbox.height
-            x_range = ax.get_xlim()
-            y_range = ax.get_ylim()
 
-            def to_px(x, y):
-                px = (x - x_range[0]) / (x_range[1] - x_range[0]) * ax_width
-                py = (y - y_range[0]) / (y_range[1] - y_range[0]) * ax_height
+            bbox = axis.get_window_extent()
+            width = bbox.width
+            height = bbox.height
+            x_range = axis.get_xlim()
+            y_range = axis.get_ylim()
+
+            def to_px(x_value, y_value):
+                px = (x_value - x_range[0]) / (x_range[1] - x_range[0]) * width
+                py = (y_value - y_range[0]) / (y_range[1] - y_range[0]) * height
                 return px, py
 
-            ex, ey = to_px(event.xdata, event.ydata)
-            for j, (cx, cy) in enumerate(zip(X_CTRL, self.ctrl_y[i])):
-                cpx, cpy = to_px(cx, cy)
-                if (ex - cpx) ** 2 + (ey - cpy) ** 2 < 12 ** 2:
-                    return i, j
+            event_x, event_y = to_px(event.xdata, event.ydata)
+            for point_idx, (ctrl_x, ctrl_y) in enumerate(zip(self.ctrl_x[curve_idx], self.ctrl_y[curve_idx])):
+                point_x, point_y = to_px(ctrl_x, ctrl_y)
+                if (event_x - point_x) ** 2 + (event_y - point_y) ** 2 < 12 ** 2:
+                    return curve_idx, point_idx
         return None
 
     def _on_press(self, event):
         hit = self._hit_test(event)
         if hit is None:
             return
-        ci, pi = hit
-        if event.button == 3:  # 右键重置
-            x_default = X_CTRL[pi]
-            self.ctrl_y[ci][pi] = x_default
-            self._update_curve(ci)
+
+        curve_idx, point_idx = hit
+        if event.button == 3:
+            self.ctrl_y[curve_idx][point_idx] = self.default_ctrl_y[curve_idx][point_idx]
+            self._update_control_scatter(curve_idx)
             self._render_preview()
         elif event.button == 1:
-            self._drag_state = (ci, pi)
+            self._drag_state = (curve_idx, point_idx)
 
-    def _on_release(self, event):
+    def _on_release(self, _event):
         self._drag_state = None
 
     def _on_motion(self, event):
         if self._drag_state is None:
             return
-        ci, pi = self._drag_state
-        ax = self.curve_axes[ci]
-        if event.inaxes is not ax:
+
+        curve_idx, point_idx = self._drag_state
+        axis = self.curve_axes[curve_idx]
+        if event.inaxes is not axis or event.ydata is None:
             return
-        if event.ydata is None:
-            return
-        ylim = self.CURVE_CFG[ci]["ylim"]
-        new_y = float(np.clip(event.ydata, ylim[0], ylim[1]))
-        self.ctrl_y[ci][pi] = new_y
-        self._update_curve(ci)
+
+        y_min, y_max = self.curve_cfg[curve_idx]["ylim"]
+        self.ctrl_y[curve_idx][point_idx] = float(np.clip(event.ydata, y_min, y_max))
+        self._update_control_scatter(curve_idx)
         self._render_preview()
+
+    def _on_key_press(self, event):
+        if event.key in {"s", "ctrl+s"}:
+            self._save_curves()
+        elif event.key == "enter":
+            self._render_full_resolution()
 
     def show(self):
         plt.show()
 
 
-# ── 入口 ─────────────────────────────────────────────────────────────────────
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Interactive Oklch state-curve editor.")
+    parser.add_argument(
+        "image_path",
+        nargs="?",
+        default=os.path.join(os.path.dirname(__file__), "..", "data", "mtmtPonyTail.png"),
+        help="Input image path.",
+    )
+    parser.add_argument(
+        "--curves",
+        dest="curve_path",
+        help="Optional JSON file containing initial Lt/Ct/ht control points.",
+    )
+    parser.add_argument(
+        "--curve-output",
+        dest="curve_output_path",
+        help="Optional JSON file path used when exporting curves from the editor.",
+    )
+    parser.add_argument(
+        "--dither-strength",
+        type=float,
+        default=DITHER_STRENGTH,
+        help="Optional pre-curve dither amplitude applied on the input lightness axis.",
+    )
+    return parser.parse_args()
+
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        image_path = sys.argv[1]
-    else:
-        image_path = os.path.join(os.path.dirname(__file__), "..", "data", "mtmtPonyTail.png")
+    args = parse_args()
+    print(f"Loading: {args.image_path}")
 
-    print(f"Loading: {image_path}")
-    rgb_float, luma_uint8, valid_mask = load_image(image_path)
-    lut_rgb = build_base_lut(luma_uint8, rgb_float, valid_mask)
-    print("Building LUT done. Opening editor...")
+    rgb_float, oklch_float, valid_mask = load_image(args.image_path)
+    base_model, _ = build_oklch_curve_model(oklch_float, valid_mask)
+    curve_overrides = load_state_curve_overrides(args.curve_path)
 
-    editor = HslCurveEditor(rgb_float, luma_uint8, valid_mask, lut_rgb)
+    print("Building Oklch base model done. Opening editor...")
+    editor = OklchCurveEditor(
+        args.image_path,
+        rgb_float,
+        oklch_float,
+        valid_mask,
+        base_model,
+        initial_curve_overrides=curve_overrides,
+        dither_strength=args.dither_strength,
+        curve_output_path=args.curve_output_path,
+    )
     editor.show()

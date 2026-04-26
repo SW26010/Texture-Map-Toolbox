@@ -1,0 +1,6 @@
+numpy
+scikit-image
+matplotlib
+colour-science
+scipy
+Pillow
