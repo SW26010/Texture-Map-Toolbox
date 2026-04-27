@@ -74,14 +74,72 @@
 - 当前脚本已全面抛弃 BT.709 灰度和 HSL 分析路径。
 - 当前脚本主流程已显式经过 `L_t / C_t / h_t` 状态曲线层；默认控制点为 identity Lightness 加基础模型的 Chroma / Hue 关键点。
 - 当前脚本默认关闭预曲线抖动（`DITHER_STRENGTH = 0.0`），但保留了在输入轴 $y$ 上先加抖动再求值的接口。
-- 当前脚本只实现离线高质量主流程，不实现实时交互预览。
+- 当前脚本在统一接口下同时保留两种算法：
+   - `original`: 原始离线高质量主流程
+   - `fast`: 与未来 GUI 共用的快速 LUT 预览算法
+
+## CLI 调用
+
+推荐通过统一 CLI 调用：
+
+```bash
+python -m scripts.cli luma path/to/image.png --algorithm original --curves path/to/curves.json
+```
+
+兼容旧入口：
+
+```bash
+python scripts/luma_color_map.py path/to/image.png --algorithm original --curves path/to/curves.json
+```
+
+额外的 CLI 选项：
+
+- `--algorithm {original,fast}`: 在原始离线算法和快速 LUT 算法之间切换
+- `--request-json path/to/request.json`: 从统一 request JSON 读取参数
+- `--no-plots`: 不弹出 matplotlib 图表
+- `--skip-evaluation`: 跳过 PSNR / Delta E 评估，仅保留生成主链路
+- `--output-image path/to/file.png`: 保存当前算法输出图像
+- `--result-json path/to/file.json`: 输出机器可读的结果 JSON，便于 GUI 或外部流程读取
+- `--preview-scale` / `--preview-lut-size`: 控制 `fast` 模式的缩图比例与 LUT 采样数量
+
+### 快速算法
+
+`fast` 模式使用与未来 GUI 预览一致的轻量路径：
+
+1. 仍然基于完整输入图构建 `C(y)` / `h(y)` 基础模型
+2. 对输入图做固定比例切片降采样
+3. 在 `[0,1]` 上烘焙一条有限长度的 Oklch LUT
+4. 在缩图上做 LUT 查表重着色
+
+示例：
+
+```bash
+python -m scripts.cli luma path/to/image.png --algorithm fast --preview-scale 0.25 --preview-lut-size 512 --output-image path/to/preview.png
+```
+
+该模式的目标是与 GUI 共享预览路径，不替代 `original` 模式的最终高质量生成。
+
+### request / result JSON
+
+推荐 GUI 或外部流程通过 JSON 与 CLI 交换数据：
+
+```bash
+python -m scripts.cli luma --request-json docs/examples/luma_request.fast.json
+```
+
+request JSON 示例：
+
+- [docs/examples/luma_request.original.json](docs/examples/luma_request.original.json)
+- [docs/examples/luma_request.fast.json](docs/examples/luma_request.fast.json)
+
+这些示例里的 `image_path` 是占位路径，使用前请替换成你的实际输入图路径。
 
 ## 外部控制点输入
 
 脚本支持通过 JSON 文件注入外部控制点：
 
 ```bash
-python scripts/luma_color_map.py path/to/image.png --curves path/to/curves.json
+python -m scripts.cli luma path/to/image.png --algorithm original --curves path/to/curves.json
 ```
 
 JSON 顶层是一个对象，可包含以下键：

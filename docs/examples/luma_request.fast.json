@@ -1,0 +1,12 @@
+{
+  "image_path": "path/to/image.png",
+  "algorithm": "fast",
+  "curve_path": null,
+  "dither_strength": 0.0,
+  "evaluate_result": false,
+  "show_plots": false,
+  "preview_scale": 0.25,
+  "preview_lut_size": 512,
+  "output_image_path": "docs/examples/luma_fast.output.png",
+  "result_json_path": "docs/examples/luma_fast.result.json"
+}

@@ -18,6 +18,21 @@ HUE_CHROMA_FLOOR = 1e-4
 DITHER_STRENGTH = 0.0
 DITHER_SEED = 0
 STATE_CURVE_CTRL_POINTS = 16
+DEFAULT_FAST_PREVIEW_SCALE = 0.25
+DEFAULT_FAST_LUT_SIZE = 512
+SUPPORTED_LUMA_ALGORITHMS = ("original", "fast")
+DEFAULT_SAMPLE_IMAGE_PATH = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "data", "mtmtPonyTail.png")
+)
+
+
+def resolve_input_image_path(image_path: str | None) -> str:
+    """解析输入图路径；若未提供则回退到本地样例图。"""
+    if image_path:
+        return image_path
+    if os.path.exists(DEFAULT_SAMPLE_IMAGE_PATH):
+        return DEFAULT_SAMPLE_IMAGE_PATH
+    raise ValueError("image_path is required because no bundled sample image is available in this checkout")
 
 
 @dataclass
@@ -41,14 +56,221 @@ class StateCurveSet:
     hue_v_interp: PchipInterpolator
 
 
+@dataclass
+class LumaExecutionRequest:
+    image_path: str | None = None
+    curve_path: str | None = None
+    algorithm: str = "original"
+    dither_strength: float = DITHER_STRENGTH
+    evaluate_result: bool = True
+    show_plots: bool = True
+    preview_scale: float = DEFAULT_FAST_PREVIEW_SCALE
+    preview_lut_size: int = DEFAULT_FAST_LUT_SIZE
+    output_image_path: str | None = None
+    result_json_path: str | None = None
+
+
+@dataclass
+class LumaPreviewFrame:
+    rgb_float: np.ndarray
+    oklch_float: np.ndarray
+    valid_mask: np.ndarray
+    y_image: np.ndarray
+    scale: float
+
+
+@dataclass
+class LumaExecutionResult:
+    algorithm: str
+    image_path: str
+    curve_path: str | None
+    dither_strength: float
+    source_image_shape: tuple[int, int]
+    output_image_shape: tuple[int, int]
+    output_scale: float
+    preview_lut_size: int | None
+    rgb_float: np.ndarray
+    oklch_float: np.ndarray
+    valid_mask: np.ndarray
+    model: OklchCurveModel
+    y_samples: np.ndarray
+    state_curves: StateCurveSet
+    recolored_rgb_float: np.ndarray
+    y_eval: np.ndarray
+    gamut_compressed_pixels: int
+    recolored_rgb_int: np.ndarray | None = None
+    psnr: float | None = None
+    delta_e_image: np.ndarray | None = None
+    delta_e_stats: dict[str, float] | None = None
+    gamut_compressed_lut_entries: int | None = None
+    output_image_path: str | None = None
+
+
 def rgb_to_oklch(rgb_float: np.ndarray) -> np.ndarray:
     """将 sRGB 浮点图像转换为 Oklch。"""
-    return colour.Oklab_to_Oklch(colour.XYZ_to_Oklab(colour.sRGB_to_XYZ(rgb_float)))
+    linear_rgb = srgb_to_linear(rgb_float)
+    oklab = linear_srgb_to_oklab(linear_rgb)
+    lightness = oklab[:, :, 0]
+    a_channel = oklab[:, :, 1]
+    b_channel = oklab[:, :, 2]
+    chroma = np.hypot(a_channel, b_channel)
+    hue = (np.degrees(np.arctan2(b_channel, a_channel)) + 360.0) % 360.0
+    return np.stack([lightness, chroma, hue], axis=-1)
 
 
 def oklch_to_rgb(oklch_float: np.ndarray) -> np.ndarray:
     """将 Oklch 浮点图像转换回 sRGB。"""
-    return colour.XYZ_to_sRGB(colour.Oklab_to_XYZ(colour.Oklch_to_Oklab(oklch_float)))
+    lightness = oklch_float[..., 0]
+    chroma = oklch_float[..., 1]
+    hue_rad = np.deg2rad(oklch_float[..., 2])
+    oklab = np.stack([lightness, chroma * np.cos(hue_rad), chroma * np.sin(hue_rad)], axis=-1)
+    linear_rgb = oklab_to_linear_srgb(oklab)
+    return linear_to_srgb(linear_rgb)
+
+
+def srgb_to_linear(rgb_float: np.ndarray) -> np.ndarray:
+    """将 gamma-encoded sRGB 转换为 linear sRGB。"""
+    rgb_float = np.asarray(rgb_float, dtype=np.float64)
+    linear_rgb = np.empty_like(rgb_float)
+    low_mask = rgb_float <= 0.04045
+    linear_rgb[low_mask] = rgb_float[low_mask] / 12.92
+    high_mask = ~low_mask
+    linear_rgb[high_mask] = ((rgb_float[high_mask] + 0.055) / 1.055) ** 2.4
+    return linear_rgb
+
+
+def linear_to_srgb(linear_rgb: np.ndarray) -> np.ndarray:
+    """将 linear sRGB 转换为 gamma-encoded sRGB，并保留越界符号供 gamut 检测。"""
+    linear_rgb = np.asarray(linear_rgb, dtype=np.float64)
+    rgb_float = np.empty_like(linear_rgb)
+    low_mask = linear_rgb <= 0.0031308
+    rgb_float[low_mask] = 12.92 * linear_rgb[low_mask]
+    high_mask = ~low_mask
+    rgb_float[high_mask] = 1.055 * np.power(linear_rgb[high_mask], 1.0 / 2.4) - 0.055
+    return rgb_float
+
+
+def linear_srgb_to_oklab(linear_rgb: np.ndarray) -> np.ndarray:
+    """按 Oklab 原始公式将 linear sRGB 转为 Oklab。"""
+    red = linear_rgb[..., 0]
+    green = linear_rgb[..., 1]
+    blue = linear_rgb[..., 2]
+
+    l_channel = 0.4122214708 * red + 0.5363325363 * green + 0.0514459929 * blue
+    m_channel = 0.2119034982 * red + 0.6806995451 * green + 0.1073969566 * blue
+    s_channel = 0.0883024619 * red + 0.2817188376 * green + 0.6299787005 * blue
+
+    l_root = np.cbrt(l_channel)
+    m_root = np.cbrt(m_channel)
+    s_root = np.cbrt(s_channel)
+
+    return np.stack(
+        [
+            0.2104542553 * l_root + 0.7936177850 * m_root - 0.0040720468 * s_root,
+            1.9779984951 * l_root - 2.4285922050 * m_root + 0.4505937099 * s_root,
+            0.0259040371 * l_root + 0.7827717662 * m_root - 0.8086757660 * s_root,
+        ],
+        axis=-1,
+    )
+
+
+def oklab_to_linear_srgb(oklab: np.ndarray) -> np.ndarray:
+    """按 Oklab 原始公式将 Oklab 转回 linear sRGB。"""
+    lightness = oklab[..., 0]
+    a_channel = oklab[..., 1]
+    b_channel = oklab[..., 2]
+
+    l_root = lightness + 0.3963377774 * a_channel + 0.2158037573 * b_channel
+    m_root = lightness - 0.1055613458 * a_channel - 0.0638541728 * b_channel
+    s_root = lightness - 0.0894841775 * a_channel - 1.2914855480 * b_channel
+
+    l_channel = l_root * l_root * l_root
+    m_channel = m_root * m_root * m_root
+    s_channel = s_root * s_root * s_root
+
+    return np.stack(
+        [
+            4.0767416621 * l_channel - 3.3077115913 * m_channel + 0.2309699292 * s_channel,
+            -1.2684380046 * l_channel + 2.6097574011 * m_channel - 0.3413193965 * s_channel,
+            -0.0041960863 * l_channel - 0.7034186147 * m_channel + 1.7076147010 * s_channel,
+        ],
+        axis=-1,
+    )
+
+
+def compute_oklab_max_saturation(a_unit: np.ndarray, b_unit: np.ndarray) -> np.ndarray:
+    """求给定 hue 方向在 sRGB 内可达到的最大 S=C/L。"""
+    red_region = (-1.88170328 * a_unit - 0.80936493 * b_unit) > 1.0
+    green_region = (~red_region) & ((1.81444104 * a_unit - 1.19445276 * b_unit) > 1.0)
+    blue_region = ~(red_region | green_region)
+
+    k0 = np.select([red_region, green_region, blue_region], [1.19086277, 0.73956515, 1.35733652])
+    k1 = np.select([red_region, green_region, blue_region], [1.76576728, -0.45954404, -0.00915799])
+    k2 = np.select([red_region, green_region, blue_region], [0.59662641, 0.08285427, -1.15130210])
+    k3 = np.select([red_region, green_region, blue_region], [0.75515197, 0.12541070, -0.50559606])
+    k4 = np.select([red_region, green_region, blue_region], [0.56771245, 0.14503204, 0.00692167])
+    weight_l = np.select([red_region, green_region, blue_region], [4.0767416621, -1.2684380046, -0.0041960863])
+    weight_m = np.select([red_region, green_region, blue_region], [-3.3077115913, 2.6097574011, -0.7034186147])
+    weight_s = np.select([red_region, green_region, blue_region], [0.2309699292, -0.3413193965, 1.7076147010])
+
+    saturation = k0 + k1 * a_unit + k2 * b_unit + k3 * a_unit * a_unit + k4 * a_unit * b_unit
+
+    k_l = 0.3963377774 * a_unit + 0.2158037573 * b_unit
+    k_m = -0.1055613458 * a_unit - 0.0638541728 * b_unit
+    k_s = -0.0894841775 * a_unit - 1.2914855480 * b_unit
+
+    l_root = 1.0 + saturation * k_l
+    m_root = 1.0 + saturation * k_m
+    s_root = 1.0 + saturation * k_s
+
+    l_channel = l_root * l_root * l_root
+    m_channel = m_root * m_root * m_root
+    s_channel = s_root * s_root * s_root
+
+    l_d1 = 3.0 * k_l * l_root * l_root
+    m_d1 = 3.0 * k_m * m_root * m_root
+    s_d1 = 3.0 * k_s * s_root * s_root
+
+    l_d2 = 6.0 * k_l * k_l * l_root
+    m_d2 = 6.0 * k_m * k_m * m_root
+    s_d2 = 6.0 * k_s * k_s * s_root
+
+    f_value = weight_l * l_channel + weight_m * m_channel + weight_s * s_channel
+    f_d1 = weight_l * l_d1 + weight_m * m_d1 + weight_s * s_d1
+    f_d2 = weight_l * l_d2 + weight_m * m_d2 + weight_s * s_d2
+    return saturation - f_value * f_d1 / (f_d1 * f_d1 - 0.5 * f_value * f_d2)
+
+
+def find_oklab_cusp(a_unit: np.ndarray, b_unit: np.ndarray):
+    """求给定 hue 方向在 sRGB gamut 边界上的 cusp。"""
+    saturation_cusp = compute_oklab_max_saturation(a_unit, b_unit)
+    cusp_lab = np.stack([np.ones_like(a_unit), saturation_cusp * a_unit, saturation_cusp * b_unit], axis=-1)
+    rgb_at_cusp = oklab_to_linear_srgb(cusp_lab)
+    rgb_max = np.maximum(np.max(rgb_at_cusp, axis=-1), 1e-8)
+    lightness_cusp = np.cbrt(1.0 / rgb_max)
+    chroma_cusp = lightness_cusp * saturation_cusp
+    return lightness_cusp, chroma_cusp
+
+
+def find_oklab_gamut_intersection_preserve_lightness(
+    lightness: np.ndarray,
+    chroma: np.ndarray,
+    a_unit: np.ndarray,
+    b_unit: np.ndarray,
+) -> np.ndarray:
+    """在固定 L 和 hue 的前提下，求 Oklch 射线与 sRGB gamut 的解析交点比例。"""
+    lightness_cusp, chroma_cusp = find_oklab_cusp(a_unit, b_unit)
+    denominator = chroma * lightness_cusp
+    return np.clip(
+        np.divide(
+            chroma_cusp * lightness,
+            denominator,
+            out=np.zeros_like(chroma),
+            where=np.abs(denominator) > 1e-12,
+        ),
+        0.0,
+        1.0,
+    )
 
 
 def load_image(image_path: str):
@@ -64,6 +286,155 @@ def load_image(image_path: str):
     valid_mask = alpha_float > 0.5
     oklch_float = rgb_to_oklch(rgb_float)
     return rgb_float, oklch_float, valid_mask
+
+
+def build_luma_preview_frame(
+    rgb_float: np.ndarray,
+    oklch_float: np.ndarray,
+    valid_mask: np.ndarray,
+    preview_scale: float = DEFAULT_FAST_PREVIEW_SCALE,
+) -> LumaPreviewFrame:
+    """按固定比例切片降采样，构建与 GUI 预览一致的快速输入帧。"""
+    if preview_scale <= 0.0:
+        raise ValueError("preview_scale must be > 0")
+
+    height, width = oklch_float.shape[:2]
+    preview_height = max(1, int(height * preview_scale))
+    preview_width = max(1, int(width * preview_scale))
+    step_y = max(1, height // preview_height)
+    step_x = max(1, width // preview_width)
+
+    rgb_small = rgb_float[::step_y, ::step_x]
+    oklch_small = oklch_float[::step_y, ::step_x]
+    mask_small = valid_mask[::step_y, ::step_x]
+    return LumaPreviewFrame(
+        rgb_float=rgb_small,
+        oklch_float=oklch_small,
+        valid_mask=mask_small,
+        y_image=oklch_small[:, :, 0],
+        scale=float(preview_scale),
+    )
+
+
+def compute_luma_lut_indices(y_image: np.ndarray, lut_size: int) -> np.ndarray:
+    """将输入轴 y 量化到 LUT 采样索引。"""
+    if lut_size < 2:
+        raise ValueError("lut_size must be at least 2")
+    return np.clip(np.round(y_image * (lut_size - 1)), 0, lut_size - 1).astype(np.int32)
+
+
+def build_luma_preview_lut(
+    state_curves: StateCurveSet,
+    preview_lut_size: int = DEFAULT_FAST_LUT_SIZE,
+) -> tuple[np.ndarray, np.ndarray]:
+    """生成与 GUI 快速预览一致的 LUT，并返回被压缩的 LUT 条目标记。"""
+    preview_x = np.linspace(0.0, 1.0, preview_lut_size)
+    lightness = np.clip(state_curves.lightness_interp(preview_x), 0.0, 1.0)
+    chroma = np.clip(state_curves.chroma_interp(lightness), 0.0, None)
+
+    hue_u = state_curves.hue_u_interp(lightness)
+    hue_v = state_curves.hue_v_interp(lightness)
+    hue_norm = np.hypot(hue_u, hue_v)
+    safe_norm = np.where(hue_norm < 1e-8, 1.0, hue_norm)
+    hue = (np.degrees(np.arctan2(hue_v / safe_norm, hue_u / safe_norm)) + 360.0) % 360.0
+
+    preview_oklch = np.column_stack([lightness, chroma, hue])
+    adjusted_oklch, preview_rgb, _ = compress_oklch_chroma_to_srgb(preview_oklch)
+    compressed_entries = np.abs(adjusted_oklch[:, 1] - preview_oklch[:, 1]) > 1e-10
+    preview_lut_uint8 = np.clip(np.round(preview_rgb * 255.0), 0, 255).astype(np.uint8)
+    return preview_lut_uint8, compressed_entries
+
+
+def apply_luma_preview_lut(
+    y_index_image: np.ndarray,
+    valid_mask: np.ndarray,
+    lut_uint8: np.ndarray,
+    out_buf: np.ndarray | None = None,
+) -> np.ndarray:
+    """在量化索引图上做 LUT 查表，返回 uint8 RGB 图。"""
+    if out_buf is None:
+        out_buf = np.empty((*y_index_image.shape, 3), dtype=np.uint8)
+    np.take(lut_uint8, y_index_image, axis=0, out=out_buf)
+    out_buf[~valid_mask] = 0
+    return out_buf
+
+
+def count_luma_preview_gamut_pixels(
+    y_index_image: np.ndarray,
+    valid_mask: np.ndarray,
+    compressed_entries: np.ndarray,
+) -> int:
+    """统计预览图中实际引用到被 gamut compression 的 LUT 条目的像素数。"""
+    return int(np.count_nonzero(valid_mask & compressed_entries[y_index_image]))
+
+
+def quantize_rgb_image(rgb_float: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
+    """把浮点 RGB 图量化成 uint8，并对透明区域清零。"""
+    rgb_uint8 = img_as_ubyte(np.clip(rgb_float, 0.0, 1.0))
+    rgb_uint8[~valid_mask] = 0
+    return rgb_uint8
+
+
+def save_luma_output_image(output_image: np.ndarray, output_path: str):
+    """保存 CLI / GUI 共用的结果图像。"""
+    io.imsave(output_path, output_image)
+
+
+def normalize_luma_execution_request(request: LumaExecutionRequest) -> LumaExecutionRequest:
+    """补齐默认值并校验统一执行请求。"""
+    normalized = LumaExecutionRequest(
+        image_path=resolve_input_image_path(request.image_path),
+        curve_path=request.curve_path,
+        algorithm=request.algorithm or "original",
+        dither_strength=float(request.dither_strength),
+        evaluate_result=bool(request.evaluate_result),
+        show_plots=bool(request.show_plots),
+        preview_scale=float(request.preview_scale),
+        preview_lut_size=int(request.preview_lut_size),
+        output_image_path=request.output_image_path,
+        result_json_path=request.result_json_path,
+    )
+
+    if normalized.algorithm not in SUPPORTED_LUMA_ALGORITHMS:
+        raise ValueError(f"algorithm must be one of {SUPPORTED_LUMA_ALGORITHMS}")
+    if normalized.preview_scale <= 0.0:
+        raise ValueError("preview_scale must be > 0")
+    if normalized.preview_lut_size < 2:
+        raise ValueError("preview_lut_size must be at least 2")
+    return normalized
+
+
+def luma_request_from_payload(payload: dict) -> LumaExecutionRequest:
+    """从 JSON 兼容对象构建统一执行请求。"""
+    if not isinstance(payload, dict):
+        raise ValueError("request payload must be a JSON object")
+
+    algorithm = payload.get("algorithm", "original")
+    evaluate_result = payload.get("evaluate_result")
+    if evaluate_result is None:
+        evaluate_result = algorithm == "original"
+
+    return normalize_luma_execution_request(
+        LumaExecutionRequest(
+            image_path=payload.get("image_path"),
+            curve_path=payload.get("curve_path"),
+            algorithm=algorithm,
+            dither_strength=payload.get("dither_strength", DITHER_STRENGTH),
+            evaluate_result=evaluate_result,
+            show_plots=payload.get("show_plots", True),
+            preview_scale=payload.get("preview_scale", DEFAULT_FAST_PREVIEW_SCALE),
+            preview_lut_size=payload.get("preview_lut_size", DEFAULT_FAST_LUT_SIZE),
+            output_image_path=payload.get("output_image_path"),
+            result_json_path=payload.get("result_json_path"),
+        )
+    )
+
+
+def load_luma_request_json(request_json_path: str) -> LumaExecutionRequest:
+    """从 JSON 文件加载统一执行请求。"""
+    with open(request_json_path, "r", encoding="utf-8-sig") as handle:
+        payload = json.load(handle)
+    return luma_request_from_payload(payload)
 
 
 def extract_quantile_keypoints(y_samples: np.ndarray, min_keypoints: int) -> np.ndarray:
@@ -321,7 +692,7 @@ def compress_oklch_chroma_to_srgb(
     valid_mask: np.ndarray | None = None,
     iterations: int = 12,
 ):
-    """固定 L 和 h，仅通过压缩 C 将颜色拉回 sRGB gamut。"""
+    """固定 L 和 h，仅通过解析求交后压缩 C 将颜色拉回 sRGB gamut。"""
     if valid_mask is None:
         valid_mask = np.ones(oklch_values.shape[:-1], dtype=bool)
 
@@ -334,21 +705,16 @@ def compress_oklch_chroma_to_srgb(
 
     invalid_oklch = oklch_values[invalid_mask]
     lightness = invalid_oklch[:, 0]
-    chroma_hi = invalid_oklch[:, 1]
+    chroma = invalid_oklch[:, 1]
     hue = invalid_oklch[:, 2]
-    chroma_lo = np.zeros_like(chroma_hi)
-
-    for _ in range(iterations):
-        chroma_mid = 0.5 * (chroma_lo + chroma_hi)
-        candidate_oklch = np.column_stack([lightness, chroma_mid, hue])
-        candidate_rgb = oklch_to_rgb(candidate_oklch)
-        candidate_ok = np.all((candidate_rgb >= 0.0) & (candidate_rgb <= 1.0), axis=1)
-        chroma_lo = np.where(candidate_ok, chroma_mid, chroma_lo)
-        chroma_hi = np.where(candidate_ok, chroma_hi, chroma_mid)
+    hue_rad = np.deg2rad(hue)
+    a_unit = np.cos(hue_rad)
+    b_unit = np.sin(hue_rad)
+    chroma_scale = find_oklab_gamut_intersection_preserve_lightness(lightness, chroma, a_unit, b_unit)
 
     adjusted_oklch = np.array(oklch_values, copy=True)
     adjusted_invalid = adjusted_oklch[invalid_mask]
-    adjusted_invalid[:, 1] = chroma_lo
+    adjusted_invalid[:, 1] = chroma_scale * chroma
     adjusted_oklch[invalid_mask] = adjusted_invalid
 
     adjusted_rgb = np.clip(oklch_to_rgb(adjusted_oklch), 0.0, 1.0)
@@ -478,14 +844,276 @@ def plot_analysis(y_samples: np.ndarray, model: OklchCurveModel):
     plt.show(block=False)
 
 
-def parse_args() -> argparse.Namespace:
-    """解析命令行参数。"""
-    parser = argparse.ArgumentParser(description="Build and evaluate an Oklch-based luma color map.")
+def run_original_luma_algorithm(request: LumaExecutionRequest) -> LumaExecutionResult:
+    """执行原始高质量离线主流程。"""
+    rgb_float, oklch_float, valid_mask = load_image(request.image_path)
+    model, y_samples = build_oklch_curve_model(oklch_float, valid_mask)
+    curve_overrides = load_state_curve_overrides(request.curve_path)
+    state_curves = build_state_curve_set(model, **curve_overrides)
+    recolored_rgb_float, _, y_eval, gamut_compressed_pixels = reconstruct_from_state_curves(
+        oklch_float,
+        valid_mask,
+        state_curves,
+        dither_strength=request.dither_strength,
+    )
+    recolored_rgb_int = quantize_rgb_image(recolored_rgb_float, valid_mask)
+
+    psnr = None
+    delta_e_image = None
+    delta_e_stats = None
+    if request.evaluate_result:
+        recolored_rgb_int, psnr, delta_e_image, delta_e_stats = evaluate_reconstruction(
+            rgb_float,
+            recolored_rgb_float,
+            valid_mask,
+        )
+
+    return LumaExecutionResult(
+        algorithm="original",
+        image_path=request.image_path,
+        curve_path=request.curve_path,
+        dither_strength=request.dither_strength,
+        source_image_shape=tuple(int(value) for value in rgb_float.shape[:2]),
+        output_image_shape=tuple(int(value) for value in rgb_float.shape[:2]),
+        output_scale=1.0,
+        preview_lut_size=None,
+        rgb_float=rgb_float,
+        oklch_float=oklch_float,
+        valid_mask=valid_mask,
+        model=model,
+        y_samples=y_samples,
+        state_curves=state_curves,
+        recolored_rgb_float=recolored_rgb_float,
+        y_eval=y_eval,
+        gamut_compressed_pixels=gamut_compressed_pixels,
+        recolored_rgb_int=recolored_rgb_int,
+        psnr=psnr,
+        delta_e_image=delta_e_image,
+        delta_e_stats=delta_e_stats,
+    )
+
+
+def run_fast_luma_algorithm(request: LumaExecutionRequest) -> LumaExecutionResult:
+    """执行与未来 GUI 预览一致的快速 LUT 算法。"""
+    source_rgb_float, source_oklch_float, source_valid_mask = load_image(request.image_path)
+    model, y_samples = build_oklch_curve_model(source_oklch_float, source_valid_mask)
+    curve_overrides = load_state_curve_overrides(request.curve_path)
+    state_curves = build_state_curve_set(model, **curve_overrides)
+
+    preview_frame = build_luma_preview_frame(
+        source_rgb_float,
+        source_oklch_float,
+        source_valid_mask,
+        preview_scale=request.preview_scale,
+    )
+    y_eval = apply_precurve_dither(preview_frame.y_image, preview_frame.valid_mask, request.dither_strength)
+    y_index = compute_luma_lut_indices(y_eval, request.preview_lut_size)
+    preview_lut_uint8, compressed_entries = build_luma_preview_lut(
+        state_curves,
+        preview_lut_size=request.preview_lut_size,
+    )
+    recolored_rgb_int = apply_luma_preview_lut(y_index, preview_frame.valid_mask, preview_lut_uint8)
+    recolored_rgb_float = img_as_float(recolored_rgb_int)
+    gamut_compressed_pixels = count_luma_preview_gamut_pixels(
+        y_index,
+        preview_frame.valid_mask,
+        compressed_entries,
+    )
+
+    psnr = None
+    delta_e_image = None
+    delta_e_stats = None
+    if request.evaluate_result:
+        recolored_rgb_int, psnr, delta_e_image, delta_e_stats = evaluate_reconstruction(
+            preview_frame.rgb_float,
+            recolored_rgb_float,
+            preview_frame.valid_mask,
+        )
+
+    return LumaExecutionResult(
+        algorithm="fast",
+        image_path=request.image_path,
+        curve_path=request.curve_path,
+        dither_strength=request.dither_strength,
+        source_image_shape=tuple(int(value) for value in source_rgb_float.shape[:2]),
+        output_image_shape=tuple(int(value) for value in preview_frame.rgb_float.shape[:2]),
+        output_scale=preview_frame.scale,
+        preview_lut_size=request.preview_lut_size,
+        rgb_float=preview_frame.rgb_float,
+        oklch_float=preview_frame.oklch_float,
+        valid_mask=preview_frame.valid_mask,
+        model=model,
+        y_samples=y_samples,
+        state_curves=state_curves,
+        recolored_rgb_float=recolored_rgb_float,
+        y_eval=y_eval,
+        gamut_compressed_pixels=gamut_compressed_pixels,
+        recolored_rgb_int=recolored_rgb_int,
+        psnr=psnr,
+        delta_e_image=delta_e_image,
+        delta_e_stats=delta_e_stats,
+        gamut_compressed_lut_entries=int(np.count_nonzero(compressed_entries)),
+    )
+
+
+def run_luma_workflow(request: LumaExecutionRequest) -> LumaExecutionResult:
+    """按统一请求执行原始或快速算法。"""
+    request = normalize_luma_execution_request(request)
+    if request.algorithm == "original":
+        return run_original_luma_algorithm(request)
+    if request.algorithm == "fast":
+        return run_fast_luma_algorithm(request)
+    raise ValueError(f"Unsupported algorithm: {request.algorithm}")
+
+
+def run_luma_color_map(
+    image_path: str | None = None,
+    *,
+    curve_path: str | None = None,
+    dither_strength: float = DITHER_STRENGTH,
+    evaluate_result: bool = True,
+    algorithm: str = "original",
+    preview_scale: float = DEFAULT_FAST_PREVIEW_SCALE,
+    preview_lut_size: int = DEFAULT_FAST_LUT_SIZE,
+) -> LumaExecutionResult:
+    """统一入口：运行原始高质量算法或共享的快速 LUT 算法。"""
+    return run_luma_workflow(
+        LumaExecutionRequest(
+            image_path=image_path,
+            curve_path=curve_path,
+            algorithm=algorithm,
+            dither_strength=dither_strength,
+            evaluate_result=evaluate_result,
+            preview_scale=preview_scale,
+            preview_lut_size=preview_lut_size,
+        )
+    )
+
+
+def summarize_luma_result(result: LumaExecutionResult) -> dict:
+    """将主流程结果压缩为适合日志或 JSON 的摘要。"""
+    summary = {
+        "algorithm": result.algorithm,
+        "image_path": result.image_path,
+        "curve_path": result.curve_path,
+        "curve_source": result.curve_path or "default base-model controls",
+        "dither_strength": float(result.dither_strength),
+        "source_image_shape": list(result.source_image_shape),
+        "output_image_shape": list(result.output_image_shape),
+        "output_scale": float(result.output_scale),
+        "preview_lut_size": result.preview_lut_size,
+        "keypoints": int(result.model.key_y.size),
+        "state_curve_points": {
+            "lightness": int(result.state_curves.lightness_points.shape[0]),
+            "chroma": int(result.state_curves.chroma_points.shape[0]),
+            "hue": int(result.state_curves.hue_points.shape[0]),
+        },
+        "gamut_compressed_pixels": int(result.gamut_compressed_pixels),
+        "evaluation_enabled": result.delta_e_stats is not None,
+        "output_image_path": result.output_image_path,
+    }
+    if result.gamut_compressed_lut_entries is not None:
+        summary["gamut_compressed_lut_entries"] = int(result.gamut_compressed_lut_entries)
+    if result.psnr is not None:
+        summary["psnr"] = float(result.psnr)
+    if result.delta_e_stats is not None:
+        summary["delta_e_stats"] = {
+            key: float(value) for key, value in result.delta_e_stats.items()
+        }
+    return summary
+
+
+def print_luma_summary(result: LumaExecutionResult):
+    """打印主流程摘要。"""
+    summary = summarize_luma_result(result)
+    print(f"Algorithm: {summary['algorithm']}")
+    print("Input axis: original Oklch Lightness (L0)")
+    print(f"Curve source: {summary['curve_source']}")
+    print(
+        "Image shape: "
+        f"source={tuple(summary['source_image_shape'])}, "
+        f"output={tuple(summary['output_image_shape'])}, "
+        f"scale={summary['output_scale']:.4f}"
+    )
+    print(f"Quantile keypoints: {summary['keypoints']}")
+    print(
+        "State-curve control points: "
+        f"L={summary['state_curve_points']['lightness']}, "
+        f"C={summary['state_curve_points']['chroma']}, "
+        f"h={summary['state_curve_points']['hue']}"
+    )
+    print(f"Pre-curve dither strength: {summary['dither_strength']:.6f}")
+    if summary["preview_lut_size"] is not None:
+        print(f"Preview LUT size: {summary['preview_lut_size']}")
+    print(f"Gamut-compressed pixels: {summary['gamut_compressed_pixels']}")
+    if result.gamut_compressed_lut_entries is not None:
+        print(f"Gamut-compressed LUT entries: {result.gamut_compressed_lut_entries}")
+    if result.psnr is not None:
+        print(f"PSNR (Peak Signal-to-Noise Ratio): {result.psnr:.2f} dB")
+    if result.delta_e_stats is not None:
+        for key, value in result.delta_e_stats.items():
+            print(f"Delta E 2000 ({key.replace('_', ' ').title()}): {value:.2f}")
+    else:
+        print("Evaluation: skipped")
+
+
+def write_luma_summary_json(result: LumaExecutionResult, output_path: str):
+    """将主流程摘要写入 JSON 文件。"""
+    with open(output_path, "w", encoding="utf-8") as handle:
+        json.dump(summarize_luma_result(result), handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+
+
+def build_luma_request_from_args(args: argparse.Namespace) -> LumaExecutionRequest:
+    """将 CLI 参数折叠成统一请求对象。"""
+    if args.request_json:
+        request = load_luma_request_json(args.request_json)
+    else:
+        algorithm = args.algorithm or "original"
+        request = LumaExecutionRequest(
+            algorithm=algorithm,
+            evaluate_result=algorithm == "original",
+        )
+
+    if args.image_path is not None:
+        request.image_path = args.image_path
+    if args.curve_path is not None:
+        request.curve_path = args.curve_path
+    if args.algorithm is not None:
+        request.algorithm = args.algorithm
+    if args.dither_strength is not None:
+        request.dither_strength = args.dither_strength
+    if args.preview_scale is not None:
+        request.preview_scale = args.preview_scale
+    if args.preview_lut_size is not None:
+        request.preview_lut_size = args.preview_lut_size
+    if args.output_image is not None:
+        request.output_image_path = args.output_image
+    if args.result_json is not None:
+        request.result_json_path = args.result_json
+    if args.skip_evaluation:
+        request.evaluate_result = False
+    if args.no_plots:
+        request.show_plots = False
+
+    return normalize_luma_execution_request(request)
+
+
+def configure_cli_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    """向已有 parser 注入主流程 CLI 参数。"""
     parser.add_argument(
         "image_path",
         nargs="?",
-        default=os.path.join(os.path.dirname(__file__), "..", "data", "mtmtPonyTail.png"),
-        help="Input image path.",
+        help="Input image path. Required unless a local sample image is available.",
+    )
+    parser.add_argument(
+        "--request-json",
+        help="Optional JSON file containing a serialized luma execution request.",
+    )
+    parser.add_argument(
+        "--algorithm",
+        choices=SUPPORTED_LUMA_ALGORITHMS,
+        help="Select the algorithm: `original` keeps the offline high-quality path, `fast` uses the shared preview LUT path.",
     )
     parser.add_argument(
         "--curves",
@@ -495,42 +1123,90 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dither-strength",
         type=float,
-        default=DITHER_STRENGTH,
         help="Optional pre-curve dither amplitude applied on the input lightness axis.",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--preview-scale",
+        type=float,
+        help="Preview downsample ratio used by the shared fast algorithm.",
+    )
+    parser.add_argument(
+        "--preview-lut-size",
+        type=int,
+        help="Preview LUT size used by the shared fast algorithm.",
+    )
+    parser.add_argument(
+        "--output-image",
+        help="Optional output image path used to save the recolored result.",
+    )
+    parser.add_argument(
+        "--no-plots",
+        action="store_true",
+        help="Do not open matplotlib comparison or analysis plots.",
+    )
+    parser.add_argument(
+        "--skip-evaluation",
+        action="store_true",
+        help="Skip PSNR and Delta E evaluation to keep the run generation-only.",
+    )
+    parser.add_argument(
+        "--result-json",
+        "--summary-json",
+        dest="result_json",
+        help="Optional JSON file path used to write the run result summary.",
+    )
+    return parser
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    """构建主流程命令行 parser。"""
+    return configure_cli_parser(
+        argparse.ArgumentParser(
+            description="Run the Oklch luma workflow through the original offline algorithm or the shared fast preview LUT algorithm."
+        )
+    )
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """解析命令行参数。"""
+    return build_arg_parser().parse_args(argv)
+
+
+def execute_cli(args: argparse.Namespace) -> int:
+    """执行主流程 CLI。"""
+    request = build_luma_request_from_args(args)
+    result = run_luma_workflow(request)
+    print_luma_summary(result)
+
+    if request.output_image_path:
+        save_luma_output_image(result.recolored_rgb_int, request.output_image_path)
+        result.output_image_path = request.output_image_path
+        print(f"Output image: {request.output_image_path}")
+
+    if request.result_json_path:
+        write_luma_summary_json(result, request.result_json_path)
+        print(f"Result JSON: {request.result_json_path}")
+
+    if request.show_plots:
+        if result.recolored_rgb_int is not None and result.delta_e_image is not None and result.psnr is not None:
+            plot_comparison(
+                result.rgb_float,
+                result.y_eval,
+                result.recolored_rgb_int,
+                result.valid_mask,
+                result.psnr,
+                result.delta_e_image,
+            )
+        plot_analysis(result.y_samples, result.model)
+        plt.show()
+
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    """主流程 CLI 入口。"""
+    return execute_cli(parse_args(argv))
 
 
 if __name__ == "__main__":
-    args = parse_args()
-    image_path = args.image_path
-
-    rgb_float, oklch_float, valid_mask = load_image(image_path)
-    model, y_samples = build_oklch_curve_model(oklch_float, valid_mask)
-    curve_overrides = load_state_curve_overrides(args.curve_path)
-    state_curves = build_state_curve_set(model, **curve_overrides)
-    recolored_rgb_float, _, y_eval, gamut_compressed_pixels = reconstruct_from_state_curves(
-        oklch_float, valid_mask, state_curves, dither_strength=args.dither_strength
-    )
-    recolored_rgb_int, psnr, delta_e_image, delta_e_stats = evaluate_reconstruction(
-        rgb_float, recolored_rgb_float, valid_mask
-    )
-
-    print("Input axis: original Oklch Lightness (L0)")
-    print(f"Curve source: {args.curve_path or 'default base-model controls'}")
-    print(f"Quantile keypoints: {model.key_y.size}")
-    print(
-        "State-curve control points: "
-        f"L={state_curves.lightness_points.shape[0]}, "
-        f"C={state_curves.chroma_points.shape[0]}, "
-        f"h={state_curves.hue_points.shape[0]}"
-    )
-    print(f"Pre-curve dither strength: {args.dither_strength:.6f}")
-    print(f"Gamut-compressed pixels: {gamut_compressed_pixels}")
-    print(f"PSNR (Peak Signal-to-Noise Ratio): {psnr:.2f} dB")
-    for key, value in delta_e_stats.items():
-        print(f"Delta E 2000 ({key.replace('_', ' ').title()}): {value:.2f}")
-
-    plot_comparison(rgb_float, y_eval, recolored_rgb_int, valid_mask, psnr, delta_e_image)
-    plot_analysis(y_samples, model)
-    plt.show()
+    raise SystemExit(main())

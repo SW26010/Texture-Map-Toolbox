@@ -10,6 +10,8 @@
 
 **当前实现**：[`scripts/hsl_curve_editor.py`](../scripts/hsl_curve_editor.py)
 
+**推荐 CLI 入口**：`python -m scripts.cli editor ...`
+
 该编辑器已经和 [`scripts/luma_color_map.py`](../scripts/luma_color_map.py) 共用同一套 Oklch 主流程，默认状态下会继承基础模型，因此在未手动改曲线时，和离线主脚本的默认输出一致。
 
 ---
@@ -42,6 +44,8 @@
 2. 在 `[0, 1]` 上采样一条 512 项的 Oklch 预览 LUT
 3. 对 LUT 执行 chroma-only gamut compression
 4. 在缩小预览图上用 `np.take` 做快速查表重着色
+
+这条快速路径现在已经和 CLI 的 `python -m scripts.cli luma --algorithm fast ...` 共用同一组 helper，因此后续 GUI、CLI 和编辑器不会再各自维护一套不同的预览算法实现。
 
 这保留了当前 matplotlib 版编辑器最重要的优化点：
 

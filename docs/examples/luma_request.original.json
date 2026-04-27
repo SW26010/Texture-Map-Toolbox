@@ -1,0 +1,10 @@
+{
+  "image_path": "path/to/image.png",
+  "algorithm": "original",
+  "curve_path": null,
+  "dither_strength": 0.0,
+  "evaluate_result": true,
+  "show_plots": false,
+  "output_image_path": "docs/examples/luma_original.output.png",
+  "result_json_path": "docs/examples/luma_original.result.json"
+}

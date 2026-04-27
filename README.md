@@ -1,6 +1,6 @@
 # Texture-Map-Toolbox
 
-一组用于 3D 纹理贴图处理的 Python 工具，包含亮度色彩映射和 PBR 材质贴图生成两个工具。
+一组围绕 Oklch luma LUT 工作流构建的 Python 工具，当前重点是离线重建与状态曲线编辑。
 
 ## 项目结构
 
@@ -9,23 +9,27 @@ Texture-Map-Toolbox/
 ├── README.md                          # 项目说明
 ├── requirements.txt                   # Python 依赖
 ├── scripts/
+│   ├── cli.py                         # 统一 CLI 入口
 │   ├── luma_color_map.py              # 亮度色彩映射脚本
-│   ├── hsl_curve_editor.py            # Oklch 状态曲线编辑器
-│   └── metallic_smoothness_map.py     # 金属度/光滑度贴图生成脚本
+│   └── hsl_curve_editor.py            # Oklch 状态曲线编辑器
 ├── docs/
+│   ├── cli.md                         # CLI 结构与 GUI 准备说明
+│   ├── examples/                      # CLI request 示例
 │   ├── hsl_curve_editor_design.md     # Oklch 状态曲线编辑器设计说明
 │   ├── luma_color_map.md              # 亮度色彩映射详细文档
-│   ├── oklch_lut_design.md            # Oklch LUT 设计草案
-│   └── metallic_smoothness_map.md     # 金属度/光滑度贴图详细文档
+│   └── oklch_lut_design.md            # Oklch LUT 设计草案
 ├── luma_color_map.ipynb               # 亮度色彩映射交互式笔记本
-└── metallic_smoothness_map.ipynb      # 金属度/光滑度贴图交互式笔记本
+└── metallic_smoothness_map.ipynb      # 历史笔记本，当前不作为主工作流
 ```
 
 ## 工具说明
 
 ### 1. 亮度色彩映射 (Luma Color Map)
 
-从彩色图像出发，先转换到 Oklch，直接使用原始 Oklch 的 Lightness ($L_0$) 作为输入轴。脚本基于 per-pixel 样本云拟合连续的 $C(y)$ / $h(y)$ 曲线，用于重建图像并通过 PSNR 和 CIEDE2000 评估质量。
+从彩色图像出发，先转换到 Oklch，直接使用原始 Oklch 的 Lightness ($L_0$) 作为输入轴。当前 CLI 在同一接口下同时保留：
+
+- `original`：原始离线高质量主流程
+- `fast`：与未来 GUI 共享的快速 LUT 预览算法
 
 - **脚本**: [`scripts/luma_color_map.py`](scripts/luma_color_map.py)
 - **笔记本**: [`luma_color_map.ipynb`](luma_color_map.ipynb) [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/SW26010/Texture-Map-Toolbox/blob/main/luma_color_map.ipynb)
@@ -39,33 +43,48 @@ Texture-Map-Toolbox/
 - **脚本**: [`scripts/hsl_curve_editor.py`](scripts/hsl_curve_editor.py)
 - **设计说明**: [`docs/hsl_curve_editor_design.md`](docs/hsl_curve_editor_design.md)
 
-### 3. 金属度/光滑度贴图生成 (Metallic Smoothness Map)
-
-从 RGB 通道用作蒙版的输入图像出发，按通道阈值分割材质区域，为每个区域指定金属度、光滑度和颜色，输出两张 PBR 贴图。
-
-- **脚本**: [`scripts/metallic_smoothness_map.py`](scripts/metallic_smoothness_map.py)
-- **笔记本**: [`metallic_smoothness_map.ipynb`](metallic_smoothness_map.ipynb) [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/SW26010/Texture-Map-Toolbox/blob/main/metallic_smoothness_map.ipynb)
-- **文档**: [`docs/metallic_smoothness_map.md`](docs/metallic_smoothness_map.md)
-
 ## 快速开始
 
 ```bash
 pip install -r requirements.txt
 ```
 
+推荐使用统一 CLI：
+
 ```bash
-# 亮度色彩映射
-python scripts/luma_color_map.py
+# 查看统一命令结构
+python -m scripts.cli --help
+
+# 原始高质量算法
+python -m scripts.cli luma path/to/image.png --algorithm original
 
 # 使用外部 Lt/Ct/ht 控制点
-python scripts/luma_color_map.py path/to/image.png --curves path/to/curves.json
+python -m scripts.cli luma path/to/image.png --algorithm original --curves path/to/curves.json
+
+# 与未来 GUI 共享的快速 LUT 算法
+python -m scripts.cli luma path/to/image.png --algorithm fast --preview-scale 0.25 --preview-lut-size 512
+
+# 使用统一 request / result JSON
+python -m scripts.cli luma --request-json docs/examples/luma_request.fast.json
 
 # Oklch 状态曲线编辑器
-python scripts/hsl_curve_editor.py path/to/image.png --curves path/to/curves.json
-
-# 金属度/光滑度贴图生成
-python scripts/metallic_smoothness_map.py
+python -m scripts.cli editor path/to/image.png --curves path/to/curves.json
 ```
+
+兼容旧调用方式：
+
+```bash
+python scripts/luma_color_map.py path/to/image.png
+python scripts/hsl_curve_editor.py path/to/image.png
+```
+
+`docs/examples/*.json` 中的 `image_path` 是占位符，使用前请替换成你的实际输入图路径。
+
+推荐给 GUI 的调用面：
+
+- `run_luma_color_map(..., algorithm="original")`
+- `run_luma_color_map(..., algorithm="fast")`
+- `launch_editor(...)`
 
 ## 依赖
 

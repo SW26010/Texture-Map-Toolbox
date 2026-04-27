@@ -1,0 +1,28 @@
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+
+# Python tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Notebook checkpoints
+.ipynb_checkpoints/
+
+# Local OS noise
+Thumbs.db
+.DS_Store
+
+# Generated example outputs
+docs/examples/*.output.png
+docs/examples/*.result.json
+
+# Local sample asset
+data/mtmtPonyTail.png

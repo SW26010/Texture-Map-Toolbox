@@ -2,7 +2,7 @@
 交互式 Oklch 状态曲线编辑器
 
 用法：
-    python scripts/hsl_curve_editor.py [图片路径] [--curves 曲线文件]
+    python scripts/hsl_curve_editor.py <图片路径> [--curves 曲线文件]
 
 操作：
     - 左键拖拽：移动控制点，实时更新预览
@@ -20,23 +20,54 @@ import matplotlib.pyplot as plt
 import numpy as np
 from scipy.interpolate import PchipInterpolator
 
-from luma_color_map import (
-    DITHER_STRENGTH,
-    STATE_CURVE_CTRL_POINTS,
-    build_oklch_curve_model,
-    build_state_curve_set,
-    compress_oklch_chroma_to_srgb,
-    evaluate_reconstruction,
-    load_image,
-    load_state_curve_overrides,
-    plot_comparison,
-    prepare_control_points,
-    reconstruct_from_state_curves,
-)
+if __package__ in {None, ""}:
+    from luma_color_map import (
+        DITHER_STRENGTH,
+        DEFAULT_FAST_LUT_SIZE,
+        DEFAULT_FAST_PREVIEW_SCALE,
+        STATE_CURVE_CTRL_POINTS,
+        apply_luma_preview_lut,
+        apply_precurve_dither,
+        build_oklch_curve_model,
+        build_state_curve_set,
+        build_luma_preview_frame,
+        build_luma_preview_lut,
+        compute_luma_lut_indices,
+        count_luma_preview_gamut_pixels,
+        evaluate_reconstruction,
+        load_image,
+        load_state_curve_overrides,
+        plot_comparison,
+        prepare_control_points,
+        reconstruct_from_state_curves,
+        resolve_input_image_path,
+    )
+else:
+    from .luma_color_map import (
+        DITHER_STRENGTH,
+        DEFAULT_FAST_LUT_SIZE,
+        DEFAULT_FAST_PREVIEW_SCALE,
+        STATE_CURVE_CTRL_POINTS,
+        apply_luma_preview_lut,
+        apply_precurve_dither,
+        build_oklch_curve_model,
+        build_state_curve_set,
+        build_luma_preview_frame,
+        build_luma_preview_lut,
+        compute_luma_lut_indices,
+        count_luma_preview_gamut_pixels,
+        evaluate_reconstruction,
+        load_image,
+        load_state_curve_overrides,
+        plot_comparison,
+        prepare_control_points,
+        reconstruct_from_state_curves,
+        resolve_input_image_path,
+    )
 
 
-PREVIEW_SCALE = 0.25
-PREVIEW_LUT_SIZE = 512
+PREVIEW_SCALE = DEFAULT_FAST_PREVIEW_SCALE
+PREVIEW_LUT_SIZE = DEFAULT_FAST_LUT_SIZE
 CURVE_LINE_SAMPLES = 512
 CURVE_X_DENSE = np.linspace(0.0, 1.0, CURVE_LINE_SAMPLES)
 
@@ -48,12 +79,6 @@ def _evaluate_hue_curve(hue_u_interp: PchipInterpolator, hue_v_interp: PchipInte
     norm = np.hypot(hue_u, hue_v)
     safe_norm = np.where(norm < 1e-8, 1.0, norm)
     return (np.degrees(np.arctan2(hue_v / safe_norm, hue_u / safe_norm)) + 360.0) % 360.0
-
-
-def recolor_fast(y_index_small, lut_uint8, invalid_mask_small, out_buf):
-    """预览专用：复用缓冲区做 LUT 查表。"""
-    np.take(lut_uint8, y_index_small, axis=0, out=out_buf)
-    out_buf[invalid_mask_small] = 0
 
 
 class OklchCurveEditor:
@@ -91,20 +116,17 @@ class OklchCurveEditor:
         return f"{stem}_state_curves.json"
 
     def _build_preview_inputs(self):
-        height, width = self.oklch_float.shape[:2]
-        preview_height = max(1, int(height * PREVIEW_SCALE))
-        preview_width = max(1, int(width * PREVIEW_SCALE))
-        step_y = max(1, height // preview_height)
-        step_x = max(1, width // preview_width)
-
-        self.oklch_small = self.oklch_float[::step_y, ::step_x]
-        self.mask_small = self.valid_mask[::step_y, ::step_x]
-        self.y_small = self.oklch_small[:, :, 0]
-        self.y_small_index = np.clip(
-            np.round(self.y_small * (PREVIEW_LUT_SIZE - 1)), 0, PREVIEW_LUT_SIZE - 1
-        ).astype(np.int32)
+        self.preview_frame = build_luma_preview_frame(
+            self.rgb_float,
+            self.oklch_float,
+            self.valid_mask,
+            preview_scale=PREVIEW_SCALE,
+        )
+        self.oklch_small = self.preview_frame.oklch_float
+        self.mask_small = self.preview_frame.valid_mask
+        self.y_small = self.preview_frame.y_image
+        self.y_small_index = compute_luma_lut_indices(self.y_small, PREVIEW_LUT_SIZE)
         self._preview_buf = np.empty((*self.y_small.shape, 3), dtype=np.uint8)
-        self._invalid_mask_small = ~self.mask_small
 
     def _sample_initial_curves(self, initial_curve_overrides: dict):
         default_lightness_x = np.linspace(0.0, 1.0, STATE_CURVE_CTRL_POINTS)
@@ -177,15 +199,16 @@ class OklchCurveEditor:
     def _build_state_curves(self):
         return build_state_curve_set(self.base_model, **self._current_control_point_payload())
 
-    def _build_preview_lut(self, state_curves):
-        preview_x = np.linspace(0.0, 1.0, PREVIEW_LUT_SIZE)
-        lightness = np.clip(state_curves.lightness_interp(preview_x), 0.0, 1.0)
-        chroma = np.clip(state_curves.chroma_interp(lightness), 0.0, None)
-        hue = _evaluate_hue_curve(state_curves.hue_u_interp, state_curves.hue_v_interp, lightness)
-
-        preview_oklch = np.column_stack([lightness, chroma, hue])
-        _, preview_rgb, gamut_pixels = compress_oklch_chroma_to_srgb(preview_oklch)
-        preview_lut_uint8 = np.clip(np.round(preview_rgb * 255.0), 0, 255).astype(np.uint8)
+    def _build_preview_lut(self, state_curves, y_index):
+        preview_lut_uint8, compressed_entries = build_luma_preview_lut(
+            state_curves,
+            preview_lut_size=PREVIEW_LUT_SIZE,
+        )
+        gamut_pixels = count_luma_preview_gamut_pixels(
+            y_index,
+            self.mask_small,
+            compressed_entries,
+        )
         return preview_lut_uint8, gamut_pixels
 
     def _sample_curve_lines(self, state_curves):
@@ -253,9 +276,14 @@ class OklchCurveEditor:
         start = time.perf_counter()
         state_curves = self._build_state_curves()
         line_values = self._sample_curve_lines(state_curves)
-        lut_uint8, gamut_pixels = self._build_preview_lut(state_curves)
+        preview_y_eval = apply_precurve_dither(self.y_small, self.mask_small, self.dither_strength)
+        if self.dither_strength > 0.0:
+            preview_y_index = compute_luma_lut_indices(preview_y_eval, PREVIEW_LUT_SIZE)
+        else:
+            preview_y_index = self.y_small_index
+        lut_uint8, gamut_pixels = self._build_preview_lut(state_curves, preview_y_index)
         mid = time.perf_counter()
-        recolor_fast(self.y_small_index, lut_uint8, self._invalid_mask_small, self._preview_buf)
+        apply_luma_preview_lut(preview_y_index, self.mask_small, lut_uint8, out_buf=self._preview_buf)
         recolor_done = time.perf_counter()
         self.preview_img.set_data(self._preview_buf)
 
@@ -378,13 +406,36 @@ class OklchCurveEditor:
         plt.show()
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Interactive Oklch state-curve editor.")
+def launch_editor(
+    image_path: str | None,
+    *,
+    curve_path: str | None = None,
+    curve_output_path: str | None = None,
+    dither_strength: float = DITHER_STRENGTH,
+) -> OklchCurveEditor:
+    """构建并返回编辑器对象，供 CLI 或 GUI 复用。"""
+    resolved_image_path = resolve_input_image_path(image_path)
+    rgb_float, oklch_float, valid_mask = load_image(resolved_image_path)
+    base_model, _ = build_oklch_curve_model(oklch_float, valid_mask)
+    curve_overrides = load_state_curve_overrides(curve_path)
+    return OklchCurveEditor(
+        resolved_image_path,
+        rgb_float,
+        oklch_float,
+        valid_mask,
+        base_model,
+        initial_curve_overrides=curve_overrides,
+        dither_strength=dither_strength,
+        curve_output_path=curve_output_path,
+    )
+
+
+def configure_cli_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    """向已有 parser 注入编辑器 CLI 参数。"""
     parser.add_argument(
         "image_path",
         nargs="?",
-        default=os.path.join(os.path.dirname(__file__), "..", "data", "mtmtPonyTail.png"),
-        help="Input image path.",
+        help="Input image path. Required unless a local sample image is available.",
     )
     parser.add_argument(
         "--curves",
@@ -402,26 +453,40 @@ def parse_args() -> argparse.Namespace:
         default=DITHER_STRENGTH,
         help="Optional pre-curve dither amplitude applied on the input lightness axis.",
     )
-    return parser.parse_args()
+    return parser
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    """构建编辑器命令行 parser。"""
+    return configure_cli_parser(
+        argparse.ArgumentParser(description="Interactive Oklch state-curve editor.")
+    )
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """解析编辑器命令行参数。"""
+    return build_arg_parser().parse_args(argv)
+
+
+def execute_cli(args: argparse.Namespace) -> int:
+    """执行编辑器 CLI。"""
+    resolved_image_path = resolve_input_image_path(args.image_path)
+    print(f"Loading: {resolved_image_path}")
+    print("Building Oklch base model done. Opening editor...")
+    editor = launch_editor(
+        resolved_image_path,
+        curve_path=args.curve_path,
+        curve_output_path=args.curve_output_path,
+        dither_strength=args.dither_strength,
+    )
+    editor.show()
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    """编辑器 CLI 入口。"""
+    return execute_cli(parse_args(argv))
 
 
 if __name__ == "__main__":
-    args = parse_args()
-    print(f"Loading: {args.image_path}")
-
-    rgb_float, oklch_float, valid_mask = load_image(args.image_path)
-    base_model, _ = build_oklch_curve_model(oklch_float, valid_mask)
-    curve_overrides = load_state_curve_overrides(args.curve_path)
-
-    print("Building Oklch base model done. Opening editor...")
-    editor = OklchCurveEditor(
-        args.image_path,
-        rgb_float,
-        oklch_float,
-        valid_mask,
-        base_model,
-        initial_curve_overrides=curve_overrides,
-        dither_strength=args.dither_strength,
-        curve_output_path=args.curve_output_path,
-    )
-    editor.show()
+    raise SystemExit(main())
