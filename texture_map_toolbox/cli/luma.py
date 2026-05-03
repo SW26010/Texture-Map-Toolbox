@@ -24,6 +24,12 @@ def print_luma_summary(result: LumaExecutionResult):
     summary = summarize_luma_result(result)
     print(f"Algorithm: {summary['algorithm']}")
     print("Input axis: original Oklch Lightness (L0)")
+    if summary["alpha_mask_path"]:
+        print(f"Alpha source: {summary['alpha_source']} ({summary['alpha_mask_path']})")
+    else:
+        print(f"Alpha source: {summary['alpha_source']}")
+    for warning in summary["image_warnings"]:
+        print(f"Warning: {warning}")
     print(f"Curve source: {summary['curve_source']}")
     print(
         "Image shape: "
@@ -66,6 +72,8 @@ def build_luma_request_from_args(args: argparse.Namespace) -> LumaExecutionReque
 
     if args.image_path is not None:
         request.image_path = args.image_path
+    if args.alpha_mask is not None:
+        request.alpha_mask_path = args.alpha_mask
     if args.curve_path is not None:
         request.curve_path = args.curve_path
     if args.algorithm is not None:
@@ -98,6 +106,11 @@ def configure_cli_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentPa
     parser.add_argument(
         "--request-json",
         help="Optional JSON file containing a serialized luma execution request.",
+    )
+    parser.add_argument(
+        "--alpha-mask",
+        dest="alpha_mask",
+        help="Optional alpha mask image. When provided, it overrides the input image alpha using a same-size binary or grayscale mask.",
     )
     parser.add_argument(
         "--algorithm",

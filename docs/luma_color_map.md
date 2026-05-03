@@ -17,12 +17,16 @@
 
 ### 输入
 
-一张带 Alpha 通道的彩色 PNG 图像。
+一张至少包含 RGB 三通道的彩色图像。推荐直接提供带 Alpha 的 PNG；如果输入是 JPG，或图像本身没有有效 Alpha，也可以额外提供一个与原图同尺寸的二值 / 灰度 alpha mask 图像。
 
 ### 处理流程
 
 1. **图像加载与预处理**
-   - 提取 RGB 和 Alpha 通道，将图像转为浮点格式 (0-1)
+   - 先检查是否提供了外部 `alpha_mask_path`；若有，则它是最高优先级 mask 来源，且必须与原图尺寸一致，允许二值或灰度
+   - 如果没有外部 mask，则检查输入图是否带有“可用”的嵌入式 Alpha；PNG 的 alpha 全为 1 会被视作没有可用 mask
+   - 若既没有外部 mask，也没有可用嵌入式 alpha，则可以选择自动检测边缘连通的无效背景区域，生成一张同尺寸二值 mask
+   - JPG、没有 alpha 的图像、以及 alpha 全为 1 的 PNG 都会发出警告；GUI 会在这种情况下询问是否立即尝试自动检测
+   - 提取 RGB 和最终采用的 Alpha，将图像转为浮点格式 (0-1)
    - 使用有效掩码 (`valid_mask`) 标识非透明像素
 
 2. **转换到 Oklch**
@@ -47,6 +51,7 @@
        - $L_t(y)$ 为恒等曲线
        - $C_t(L')$ 和 $h_t(L')$ 默认继承基础模型的关键点
     - 因此在未手动修改控制点时，输出仍与基础 $C(y)$ / $h(y)$ 模型一致
+   - `valid_mask` 只用于分析、建模、直方图统计和评估；最终 LUT 应用与全分辨率重建会作用到整张图像，而不是把 mask 外区域清零
    - 转回 sRGB 时，如果颜色落在 gamut 外，则固定 $L'$ 和 $h'$，仅压缩 $C'$ 直到回到 sRGB gamut
    - 计算 PSNR（峰值信噪比）评估像素级差异
    - 计算 CIEDE2000 色差（Delta E 2000）评估人眼感知色差
@@ -142,11 +147,13 @@ result = run_luma_workflow(
 
 ```bash
 python -m texture_map_toolbox luma path/to/image.png --algorithm original --curves path/to/curves.json
+python -m texture_map_toolbox luma path/to/image.jpg --alpha-mask path/to/mask.png --algorithm original
 ```
 
 额外的 CLI 选项：
 
 - `--algorithm {original,fast}`: 在原始离线算法和快速 LUT 算法之间切换
+- `--alpha-mask path/to/mask.png`: 用外部同尺寸二值 / 灰度图覆盖输入图自带 alpha
 - `--request-json path/to/request.json`: 从统一 request JSON 读取参数
 - `--no-plots`: 不弹出 matplotlib 图表
 - `--skip-evaluation`: 跳过 PSNR / Delta E 评估，仅保留生成主链路
@@ -186,6 +193,8 @@ request JSON 示例：
 
 这些示例里的 `image_path` 是占位路径，使用前请替换成你的实际输入图路径。
 
+如果通过 request JSON 调用，也可以额外传入 `alpha_mask_path`。
+
 ## 外部控制点输入
 
 API / CLI 都支持通过 JSON 文件注入外部控制点：
@@ -204,11 +213,12 @@ python -m texture_map_toolbox luma path/to/image.png --algorithm original --curv
 - matplotlib 绘图 helper
 - 编辑器初始化、导出和全分辨率重建
 - Lightness 单调分布拟合
+- alpha 检查、外部 alpha mask 覆盖和 Qt 警告弹框
 
 运行方式：
 
 ```bash
-python -m unittest tests.test_luma_smoke tests.test_lightness_transfer_curve
+python -m unittest tests.test_luma_smoke tests.test_lightness_transfer_curve tests.test_alpha_input_validation
 ```
 
 JSON 顶层是一个对象，可包含以下键：

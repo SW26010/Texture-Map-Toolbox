@@ -7,6 +7,7 @@
 - Core：`texture_map_toolbox.core.luma`
 - API：`texture_map_toolbox.api.luma`
 - GUI：`texture_map_toolbox.gui.editor`、`texture_map_toolbox.gui.luma_plots`
+- GUI：`texture_map_toolbox.gui.editor`、`texture_map_toolbox.gui.qt_editor`、`texture_map_toolbox.gui.luma_plots`
 - CLI：`texture_map_toolbox.__main__`、`texture_map_toolbox.cli.luma`、`texture_map_toolbox.cli.editor`
 
 详细分层说明见 [`docs/architecture.md`](docs/architecture.md) 和 [`docs/cli.md`](docs/cli.md)。
@@ -85,8 +86,14 @@ pip install -e .
 # 查看统一命令结构
 python -m texture_map_toolbox --help
 
+# 无参数直接打开 Qt 加载页
+python -m texture_map_toolbox
+
 # 原始高质量算法
 python -m texture_map_toolbox luma path/to/image.png --algorithm original
+
+# 当输入图没有可用 alpha 时，用外部 mask 覆盖
+python -m texture_map_toolbox luma path/to/image.jpg --alpha-mask path/to/mask.png --algorithm original
 
 # 使用外部 Lt/Ct/ht 控制点
 python -m texture_map_toolbox luma path/to/image.png --algorithm original --curves path/to/curves.json
@@ -99,6 +106,9 @@ python -m texture_map_toolbox luma --request-json docs/examples/luma_request.fas
 
 # Oklch 状态曲线编辑器
 python -m texture_map_toolbox editor path/to/image.png --curves path/to/curves.json
+
+# 直接打开 Qt 加载页，再在 GUI 中选择原图和可选文件
+python -m texture_map_toolbox editor --backend qt
 ```
 
 安装为可编辑包后，也可以使用：
@@ -110,14 +120,20 @@ texture-map-toolbox editor path/to/image.png --curves path/to/curves.json
 
 仓库内置样例图放在 `data/` 目录下；如果命令行没有显式传入图片路径，工具会优先尝试约定的样例文件名，并在找不到时回退到 `data/` 目录里第一个可用图片。
 
+输入图像现在会显式检查 alpha，并按“外部 `--alpha-mask` > 可用嵌入式 alpha > 自动检测边缘无效区 > 无 mask 继续”的顺序决定分析用 mask。JPG、没有 alpha 的图像，以及 alpha 全为 1 的 PNG 都会给出提示；Qt GUI 在没有可用 mask 时会询问是否立即尝试自动检测。
+
+如果直接无参数启动，程序会进入 Qt 加载页；此时原图、alpha mask、初始 curves JSON 和 curves 导出路径都可以先在 GUI 里选好，再进入编辑器。编辑器成功打开后，加载页会自动关闭。
+
+Qt 编辑器里的建模、直方图和评估仍然只统计有效 mask 区域，但最终 LUT 应用和全分辨率输出会覆盖整张图像，不再把非分析区域直接清零。目标图片导入也改成了一个内置对话框：先选一张图，再用 L / C / H 复选框决定要把它应用到哪些曲线。
+
 `docs/examples/*.json` 中的 `image_path` 是占位符，使用前请替换成你的实际输入图路径。
 
 ## 测试
 
-当前仓库包含一套基于样例图的 smoke tests，覆盖 core、API、CLI、绘图和编辑器初始化：
+当前仓库包含一套基于样例图的 smoke tests，覆盖 core、API、CLI、Qt 启动页 / 编辑器初始化以及 alpha 输入校验：
 
 ```bash
-python -m unittest tests.test_luma_smoke
+python -m unittest tests.test_luma_smoke tests.test_qt_editor_smoke tests.test_alpha_input_validation
 ```
 
 ## API 与 GUI 集成
@@ -140,10 +156,10 @@ result = run_luma_workflow(request)
 ### GUI 调用
 
 ```python
-from texture_map_toolbox.gui.editor import launch_editor
+from texture_map_toolbox.gui.qt_editor import launch_qt_editor_launcher
 
-editor = launch_editor("path/to/image.png", curve_path="path/to/curves.json")
-editor.show()
+launcher = launch_qt_editor_launcher(run_event_loop=False)
+launcher.show()
 ```
 
 ## 依赖

@@ -1,6 +1,7 @@
 """Unified CLI entrypoint for Texture-Map-Toolbox."""
 
 import argparse
+import sys
 
 from texture_map_toolbox.cli import editor, luma
 
@@ -32,6 +33,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     """Run the unified CLI."""
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if not argv:
+        from texture_map_toolbox.gui.qt_editor import launch_qt_editor_launcher
+
+        launch_qt_editor_launcher()
+        return 0
+
     parser = build_arg_parser()
     args = parser.parse_args(argv)
     return args.command_func(args)

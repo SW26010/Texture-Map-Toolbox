@@ -14,6 +14,11 @@ def configure_cli_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentPa
         help="Input image path. Required unless a local sample image is available.",
     )
     parser.add_argument(
+        "--alpha-mask",
+        dest="alpha_mask_path",
+        help="Optional alpha mask image. When provided, it overrides the input image alpha using a same-size binary or grayscale mask.",
+    )
+    parser.add_argument(
         "--curves",
         dest="curve_path",
         help="Optional JSON file containing initial Lt/Ct/ht control points.",
@@ -52,6 +57,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def execute_cli(args: argparse.Namespace) -> int:
     """执行编辑器 CLI。"""
+    if args.backend == "qt" and args.image_path is None:
+        from texture_map_toolbox.gui.qt_editor import launch_qt_editor_launcher
+
+        print("Opening Qt launcher...")
+        launch_qt_editor_launcher(
+            alpha_mask_path=args.alpha_mask_path,
+            curve_path=args.curve_path,
+            curve_output_path=args.curve_output_path,
+            dither_strength=args.dither_strength,
+        )
+        return 0
+
     resolved_image_path = resolve_input_image_path(args.image_path)
     print(f"Loading: {resolved_image_path}")
     print("Building Oklch base model done. Opening editor...")
@@ -60,6 +77,7 @@ def execute_cli(args: argparse.Namespace) -> int:
 
         launch_qt_editor(
             resolved_image_path,
+            alpha_mask_path=args.alpha_mask_path,
             curve_path=args.curve_path,
             curve_output_path=args.curve_output_path,
             dither_strength=args.dither_strength,
@@ -68,10 +86,13 @@ def execute_cli(args: argparse.Namespace) -> int:
 
     editor = launch_editor(
         resolved_image_path,
+        alpha_mask_path=args.alpha_mask_path,
         curve_path=args.curve_path,
         curve_output_path=args.curve_output_path,
         dither_strength=args.dither_strength,
     )
+    for warning in getattr(editor, "image_warnings", ()): 
+        print(f"Warning: {warning}")
     editor.show()
     return 0
 

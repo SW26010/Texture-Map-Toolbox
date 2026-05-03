@@ -1,0 +1,184 @@
+import os
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+import numpy as np
+from PIL import Image
+from PySide6 import QtWidgets
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+from texture_map_toolbox.api.luma import LumaExecutionRequest, load_image_data, run_luma_workflow
+from texture_map_toolbox.gui.qt_editor import launch_qt_editor
+
+
+class AlphaInputValidationTests(unittest.TestCase):
+    def _write_rgb_image(self, path: Path, *, suffix: str):
+        rgb = np.array(
+            [
+                [[255, 32, 32], [32, 255, 32], [32, 32, 255]],
+                [[255, 255, 32], [255, 32, 255], [32, 255, 255]],
+            ],
+            dtype=np.uint8,
+        )
+        image = Image.fromarray(rgb, mode="RGB")
+        if suffix.lower() in {".jpg", ".jpeg"}:
+            image.save(path, quality=100, subsampling=0)
+            return
+        image.save(path)
+
+    def _write_rgba_png(self, path: Path, alpha_plane: np.ndarray):
+        rgb = np.array(
+            [
+                [[255, 32, 32], [32, 255, 32], [32, 32, 255]],
+                [[255, 255, 32], [255, 32, 255], [32, 255, 255]],
+            ],
+            dtype=np.uint8,
+        )
+        rgba = np.dstack([rgb, np.asarray(alpha_plane, dtype=np.uint8)])
+        Image.fromarray(rgba, mode="RGBA").save(path)
+
+    def _write_grayscale_mask(self, path: Path, values: np.ndarray):
+        Image.fromarray(np.asarray(values, dtype=np.uint8), mode="L").save(path)
+
+    def _write_auto_mask_source(self, path: Path):
+        rgb = np.full((8, 8, 3), 10, dtype=np.uint8)
+        rgb[2:6, 2:6] = np.array([220, 140, 60], dtype=np.uint8)
+        Image.fromarray(rgb, mode="RGB").save(path)
+
+    def test_png_with_fully_opaque_alpha_emits_warning(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "opaque.png"
+            self._write_rgba_png(image_path, np.full((2, 3), 255, dtype=np.uint8))
+
+            loaded_image = load_image_data(str(image_path))
+
+            self.assertEqual(loaded_image.alpha_source, "implicit-opaque")
+            self.assertTrue(loaded_image.valid_mask.all())
+            self.assertTrue(loaded_image.mask_prompt_required)
+            self.assertTrue(any("fully opaque" in warning for warning in loaded_image.image_warnings))
+
+    def test_jpeg_without_alpha_emits_warning(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "opaque.jpg"
+            self._write_rgb_image(image_path, suffix=".jpg")
+
+            loaded_image = load_image_data(str(image_path))
+
+            self.assertEqual(loaded_image.alpha_source, "implicit-opaque")
+            self.assertTrue(loaded_image.valid_mask.all())
+            self.assertTrue(loaded_image.mask_prompt_required)
+            self.assertTrue(any("JPEG" in warning for warning in loaded_image.image_warnings))
+
+    def test_auto_detect_mask_uses_border_connected_background(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "auto-mask-source.png"
+            self._write_auto_mask_source(image_path)
+
+            loaded_image = load_image_data(str(image_path), auto_detect_mask=True)
+
+            self.assertEqual(loaded_image.alpha_source, "auto-detected")
+            self.assertFalse(loaded_image.mask_prompt_required)
+            self.assertFalse(loaded_image.valid_mask[0, 0])
+            self.assertTrue(loaded_image.valid_mask[3, 3])
+            self.assertTrue(any("auto-detected border mask" in warning for warning in loaded_image.image_warnings))
+
+    def test_external_alpha_mask_overrides_embedded_alpha(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "source.png"
+            mask_path = Path(temp_dir) / "mask.png"
+            self._write_rgba_png(image_path, np.full((2, 3), 255, dtype=np.uint8))
+            self._write_grayscale_mask(
+                mask_path,
+                np.array(
+                    [
+                        [0, 255, 0],
+                        [255, 64, 0],
+                    ],
+                    dtype=np.uint8,
+                ),
+            )
+
+            loaded_image = load_image_data(str(image_path), alpha_mask_path=str(mask_path))
+
+            expected_mask = np.array(
+                [
+                    [False, True, False],
+                    [True, True, False],
+                ],
+                dtype=bool,
+            )
+            self.assertEqual(loaded_image.alpha_source, "external-mask")
+            self.assertEqual(loaded_image.alpha_mask_path, str(mask_path.resolve()))
+            self.assertTrue(np.array_equal(loaded_image.valid_mask, expected_mask))
+
+    def test_alpha_mask_size_must_match_source_image(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "source.png"
+            mask_path = Path(temp_dir) / "mask.png"
+            self._write_rgba_png(image_path, np.full((2, 3), 255, dtype=np.uint8))
+            self._write_grayscale_mask(mask_path, np.zeros((3, 2), dtype=np.uint8))
+
+            with self.assertRaisesRegex(ValueError, "must match the source image size exactly"):
+                load_image_data(str(image_path), alpha_mask_path=str(mask_path))
+
+    def test_run_luma_workflow_propagates_alpha_metadata(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "opaque.jpg"
+            mask_path = Path(temp_dir) / "mask.png"
+            self._write_rgb_image(image_path, suffix=".jpg")
+            self._write_grayscale_mask(mask_path, np.full((2, 3), 255, dtype=np.uint8))
+
+            result = run_luma_workflow(
+                LumaExecutionRequest(
+                    image_path=str(image_path),
+                    alpha_mask_path=str(mask_path),
+                    algorithm="fast",
+                    show_plots=False,
+                    evaluate_result=False,
+                )
+            )
+
+            self.assertEqual(result.alpha_source, "external-mask")
+            self.assertEqual(result.alpha_mask_path, str(mask_path.resolve()))
+            self.assertTrue(any("JPEG" in warning for warning in result.image_warnings))
+
+    def test_qt_editor_launch_shows_warning_for_jpeg_input(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "opaque.jpg"
+            self._write_rgb_image(image_path, suffix=".jpg")
+
+            with mock.patch("PySide6.QtWidgets.QMessageBox.warning") as warning_box:
+                window = launch_qt_editor(str(image_path), run_event_loop=False)
+                try:
+                    warning_box.assert_called_once()
+                    self.assertIn("JPEG", warning_box.call_args.args[2])
+                finally:
+                    if window is not None:
+                        window.close()
+
+    def test_qt_editor_launch_can_auto_detect_mask_when_prompt_confirmed(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "auto-mask-source.png"
+            self._write_auto_mask_source(image_path)
+
+            with mock.patch(
+                "PySide6.QtWidgets.QMessageBox.warning",
+                return_value=QtWidgets.QMessageBox.StandardButton.Yes,
+            ) as warning_box:
+                window = launch_qt_editor(str(image_path), run_event_loop=False)
+                try:
+                    warning_box.assert_called_once()
+                    self.assertIsNotNone(window)
+                    self.assertEqual(window.alpha_source, "auto-detected")
+                    self.assertFalse(window.valid_mask[0, 0])
+                    self.assertTrue(window.valid_mask[3, 3])
+                finally:
+                    if window is not None:
+                        window.close()
+
+
+if __name__ == "__main__":
+    unittest.main()

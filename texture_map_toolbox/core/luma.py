@@ -6,6 +6,7 @@ from pathlib import Path
 
 import colour
 import numpy as np
+from scipy.ndimage import binary_propagation
 from scipy.interpolate import PchipInterpolator
 from skimage import io
 from skimage.metrics import peak_signal_noise_ratio
@@ -26,6 +27,14 @@ DEFAULT_SAMPLE_IMAGE_CANDIDATES = (
     DATA_DIRECTORY / "mtmtPonyTail.png",
 )
 SUPPORTED_IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp")
+JPEG_IMAGE_SUFFIXES = (".jpg", ".jpeg")
+ALPHA_VALID_EPSILON = 1e-6
+AUTO_MASK_BORDER_WIDTH = 2
+AUTO_MASK_COLOR_TOLERANCE = 6
+AUTO_MASK_HISTOGRAM_BIN_SIZE = 8
+AUTO_MASK_MAX_BORDER_STD = 6.0
+AUTO_MASK_MIN_EDGE_RUN = 3
+AUTO_MASK_MIN_BORDER_PIXELS = 8
 
 
 def _iter_default_sample_image_candidates():
@@ -62,6 +71,16 @@ def resolve_input_image_path(image_path: str | None) -> str:
     raise ValueError("image_path is required because no bundled sample image is available in this checkout")
 
 
+def resolve_optional_path(path: str | None, *, argument_name: str) -> str | None:
+    """Resolve an optional existing path without falling back to bundled samples."""
+    if path is None:
+        return None
+    resolved_path = Path(path).expanduser().resolve()
+    if not resolved_path.exists():
+        raise FileNotFoundError(f"{argument_name} not found: {resolved_path}")
+    return str(resolved_path)
+
+
 @dataclass
 class OklchCurveModel:
     key_y: np.ndarray
@@ -86,6 +105,7 @@ class StateCurveSet:
 @dataclass
 class LumaExecutionRequest:
     image_path: str | None = None
+    alpha_mask_path: str | None = None
     curve_path: str | None = None
     algorithm: str = "original"
     dither_strength: float = DITHER_STRENGTH
@@ -107,9 +127,23 @@ class LumaPreviewFrame:
 
 
 @dataclass
+class LoadedImageData:
+    image_path: str
+    alpha_mask_path: str | None
+    rgb_float: np.ndarray
+    alpha_float: np.ndarray
+    oklch_float: np.ndarray
+    valid_mask: np.ndarray
+    alpha_source: str
+    image_warnings: tuple[str, ...] = ()
+    mask_prompt_required: bool = False
+
+
+@dataclass
 class LumaExecutionResult:
     algorithm: str
     image_path: str
+    alpha_mask_path: str | None
     curve_path: str | None
     dither_strength: float
     source_image_shape: tuple[int, int]
@@ -125,6 +159,8 @@ class LumaExecutionResult:
     recolored_rgb_float: np.ndarray
     y_eval: np.ndarray
     gamut_compressed_pixels: int
+    alpha_source: str = "embedded"
+    image_warnings: tuple[str, ...] = ()
     recolored_rgb_int: np.ndarray | None = None
     psnr: float | None = None
     delta_e_image: np.ndarray | None = None
@@ -300,22 +336,249 @@ def find_oklab_gamut_intersection_preserve_lightness(
     )
 
 
-def load_image(image_path: str):
-    """加载图像，提取 RGB、Alpha 和原始 Oklch。"""
-    original_image = io.imread(image_path)
+def _collapse_alpha_mask_to_scalar(mask_float: np.ndarray) -> np.ndarray:
+    """Collapse a mask image with arbitrary channels into one scalar alpha plane."""
+    mask_float = np.asarray(mask_float, dtype=np.float64)
+    if mask_float.ndim == 2:
+        return mask_float
+    if mask_float.ndim != 3 or mask_float.shape[2] < 1:
+        raise ValueError("alpha mask image must be grayscale or have at least one channel")
+
+    channel_count = mask_float.shape[2]
+    if channel_count == 1:
+        return mask_float[:, :, 0]
+
+    if channel_count in {2, 4}:
+        explicit_alpha = mask_float[:, :, -1]
+        if not np.allclose(explicit_alpha, 1.0, atol=ALPHA_VALID_EPSILON):
+            return explicit_alpha
+        color_channels = mask_float[:, :, :-1]
+    else:
+        color_channels = mask_float[:, :, : min(channel_count, 3)]
+
+    if color_channels.shape[2] == 1:
+        return color_channels[:, :, 0]
+    if color_channels.shape[2] >= 3:
+        return np.tensordot(
+            color_channels[:, :, :3],
+            np.array([0.2126, 0.7152, 0.0722], dtype=np.float64),
+            axes=([-1], [0]),
+        )
+    return np.mean(color_channels, axis=-1)
+
+
+def _load_alpha_mask(alpha_mask_path: str, expected_shape: tuple[int, int]) -> np.ndarray:
+    """Load and validate an external alpha mask image."""
+    mask_image = io.imread(alpha_mask_path)
+    mask_float = img_as_float(mask_image)
+    alpha_float = np.clip(_collapse_alpha_mask_to_scalar(mask_float), 0.0, 1.0)
+    if alpha_float.shape != expected_shape:
+        raise ValueError(
+            "alpha mask image must match the source image size exactly: "
+            f"expected {expected_shape}, got {alpha_float.shape}"
+        )
+    return np.asarray(alpha_float, dtype=np.float64)
+
+
+def _build_border_mask(image_shape: tuple[int, int], border_width: int) -> np.ndarray:
+    """Build a boolean mask that covers the outer border strip of an image."""
+    height, width = image_shape
+    effective_width = max(1, min(int(border_width), max(1, min(height, width) // 2)))
+    border_mask = np.zeros((height, width), dtype=bool)
+    border_mask[:effective_width, :] = True
+    border_mask[-effective_width:, :] = True
+    border_mask[:, :effective_width] = True
+    border_mask[:, -effective_width:] = True
+    return border_mask
+
+
+def _longest_true_run(values: np.ndarray) -> int:
+    """Return the longest contiguous run of True values in a 1D boolean array."""
+    if values.size == 0:
+        return 0
+    padded = np.concatenate([
+        np.array([False], dtype=bool),
+        np.asarray(values, dtype=bool),
+        np.array([False], dtype=bool),
+    ])
+    transitions = np.diff(padded.astype(np.int8))
+    starts = np.flatnonzero(transitions == 1)
+    ends = np.flatnonzero(transitions == -1)
+    if starts.size == 0:
+        return 0
+    return int(np.max(ends - starts))
+
+
+def _candidate_has_edge_run(candidate_mask: np.ndarray, border_width: int, min_edge_run: int) -> bool:
+    """Check whether a candidate border mask contains a sufficiently long edge run."""
+    height, width = candidate_mask.shape
+    effective_width = max(1, min(int(border_width), max(1, min(height, width) // 2)))
+    edge_lines = []
+    edge_lines.extend(candidate_mask[row, :] for row in range(effective_width))
+    edge_lines.extend(candidate_mask[height - 1 - row, :] for row in range(effective_width))
+    edge_lines.extend(candidate_mask[:, column] for column in range(effective_width))
+    edge_lines.extend(candidate_mask[:, width - 1 - column] for column in range(effective_width))
+    return any(_longest_true_run(line) >= int(min_edge_run) for line in edge_lines)
+
+
+def detect_auto_valid_mask(
+    rgb_float: np.ndarray,
+    *,
+    border_width: int = AUTO_MASK_BORDER_WIDTH,
+    color_tolerance: int = AUTO_MASK_COLOR_TOLERANCE,
+    histogram_bin_size: int = AUTO_MASK_HISTOGRAM_BIN_SIZE,
+    max_border_std: float = AUTO_MASK_MAX_BORDER_STD,
+    min_edge_run: int = AUTO_MASK_MIN_EDGE_RUN,
+    min_border_pixels: int = AUTO_MASK_MIN_BORDER_PIXELS,
+) -> np.ndarray:
+    """Auto-detect a border-connected invalid region and return a valid-pixel mask."""
+    rgb_uint8 = img_as_ubyte(np.clip(np.asarray(rgb_float, dtype=np.float64), 0.0, 1.0))
+    border_mask = _build_border_mask(rgb_uint8.shape[:2], border_width)
+    border_pixels = rgb_uint8[border_mask].reshape(-1, 3)
+    if border_pixels.size == 0:
+        raise ValueError("auto-detect mask requires a non-empty image")
+
+    binned_border_pixels = border_pixels // max(1, int(histogram_bin_size))
+    unique_bins, counts = np.unique(binned_border_pixels, axis=0, return_counts=True)
+    dominant_index = int(np.argmax(counts))
+    dominant_bin = unique_bins[dominant_index]
+    dominant_pixels = border_pixels[np.all(binned_border_pixels == dominant_bin, axis=1)]
+    if dominant_pixels.shape[0] < max(int(min_border_pixels), int(min_edge_run)):
+        raise ValueError("auto-detect mask could not find a stable border color candidate")
+
+    dominant_std = np.std(dominant_pixels.astype(np.float64), axis=0)
+    if float(np.max(dominant_std)) > float(max_border_std):
+        raise ValueError("auto-detect mask found a border color candidate, but it varies too much to trust")
+
+    dominant_color = np.round(np.mean(dominant_pixels.astype(np.float64), axis=0)).astype(np.int16)
+    rgb_int16 = rgb_uint8.astype(np.int16)
+    candidate_mask = np.max(np.abs(rgb_int16 - dominant_color[None, None, :]), axis=-1) <= int(color_tolerance)
+    border_seed = candidate_mask & border_mask
+    if np.count_nonzero(border_seed) < max(int(min_border_pixels), int(min_edge_run)):
+        raise ValueError("auto-detect mask could not find enough border-connected pixels for the dominant color")
+    if not _candidate_has_edge_run(border_seed, border_width, min_edge_run):
+        raise ValueError("auto-detect mask could not find a long enough constant-color run on the image edge")
+
+    invalid_mask = binary_propagation(border_seed, mask=candidate_mask)
+    valid_mask = ~invalid_mask
+    if not np.any(invalid_mask):
+        raise ValueError("auto-detect mask did not find any border-connected invalid region")
+    if not np.any(valid_mask):
+        raise ValueError("auto-detect mask would remove the entire image")
+    return np.asarray(valid_mask, dtype=bool)
+
+
+def _build_image_alpha_warnings(
+    image_path: str,
+    has_embedded_alpha: bool,
+    embedded_alpha: np.ndarray,
+    alpha_source: str,
+    mask_prompt_required: bool,
+) -> tuple[str, ...]:
+    """Build user-facing warnings related to alpha-channel handling."""
+    warnings: list[str] = []
+    suffix = Path(image_path).suffix.lower()
+    opaque_png_alpha = suffix == ".png" and has_embedded_alpha and np.all(embedded_alpha >= 1.0 - ALPHA_VALID_EPSILON)
+
+    if alpha_source == "external-mask":
+        if suffix in JPEG_IMAGE_SUFFIXES:
+            warnings.append("Input JPEG image has no embedded alpha channel; using the external alpha mask instead.")
+        elif opaque_png_alpha:
+            warnings.append("Input PNG alpha channel is fully opaque; using the external alpha mask instead.")
+    elif alpha_source == "auto-detected":
+        if suffix in JPEG_IMAGE_SUFFIXES:
+            warnings.append("Input JPEG image has no embedded alpha channel; using the auto-detected border mask instead.")
+        elif opaque_png_alpha:
+            warnings.append("Input PNG alpha channel is fully opaque; using the auto-detected border mask instead.")
+        elif not has_embedded_alpha:
+            warnings.append("Input image has no embedded alpha channel; using the auto-detected border mask instead.")
+    elif alpha_source == "implicit-opaque":
+        if suffix in JPEG_IMAGE_SUFFIXES:
+            warnings.append("Input JPEG image has no embedded alpha channel.")
+        elif opaque_png_alpha:
+            warnings.append("Input PNG alpha channel is fully opaque and behaves like no mask.")
+        elif not has_embedded_alpha:
+            warnings.append("Input image has no embedded alpha channel.")
+        if mask_prompt_required:
+            warnings.append("No usable alpha mask was found. You can provide one or try auto-detect.")
+
+    return tuple(warnings)
+
+
+def load_image_data(
+    image_path: str,
+    *,
+    alpha_mask_path: str | None = None,
+    auto_detect_mask: bool = False,
+) -> LoadedImageData:
+    """Load RGB and alpha coverage data, preserving warnings and alpha provenance."""
+    resolved_image_path = resolve_input_image_path(image_path)
+    resolved_alpha_mask_path = resolve_optional_path(alpha_mask_path, argument_name="alpha mask image")
+
+    original_image = io.imread(resolved_image_path)
     image_float = img_as_float(original_image)
     if image_float.ndim != 3 or image_float.shape[2] < 3:
         raise ValueError("input image must contain at least three color channels")
 
-    rgb_float = image_float[:, :, :3]
-    alpha_float = (
-        image_float[:, :, 3]
-        if image_float.shape[2] >= 4
-        else np.ones(rgb_float.shape[:2], dtype=rgb_float.dtype)
+    rgb_float = np.asarray(image_float[:, :, :3], dtype=np.float64)
+    has_embedded_alpha = image_float.shape[2] >= 4
+    embedded_alpha = (
+        np.asarray(image_float[:, :, 3], dtype=np.float64)
+        if has_embedded_alpha
+        else np.ones(rgb_float.shape[:2], dtype=np.float64)
     )
-    valid_mask = alpha_float > 0.5
+    embedded_alpha_is_usable = has_embedded_alpha and not np.all(embedded_alpha >= 1.0 - ALPHA_VALID_EPSILON)
+    mask_prompt_required = False
+
+    if resolved_alpha_mask_path is not None:
+        alpha_float = _load_alpha_mask(resolved_alpha_mask_path, rgb_float.shape[:2])
+        alpha_source = "external-mask"
+    elif embedded_alpha_is_usable:
+        alpha_float = embedded_alpha
+        alpha_source = "embedded"
+    elif auto_detect_mask:
+        alpha_float = detect_auto_valid_mask(rgb_float).astype(np.float64)
+        alpha_source = "auto-detected"
+    else:
+        alpha_float = np.ones(rgb_float.shape[:2], dtype=np.float64)
+        alpha_source = "implicit-opaque"
+        mask_prompt_required = True
+
+    valid_mask = np.asarray(alpha_float > ALPHA_VALID_EPSILON, dtype=bool)
     oklch_float = rgb_to_oklch(rgb_float)
-    return rgb_float, oklch_float, valid_mask
+
+    return LoadedImageData(
+        image_path=resolved_image_path,
+        alpha_mask_path=resolved_alpha_mask_path,
+        rgb_float=rgb_float,
+        alpha_float=alpha_float,
+        oklch_float=oklch_float,
+        valid_mask=valid_mask,
+        alpha_source=alpha_source,
+        image_warnings=_build_image_alpha_warnings(
+            resolved_image_path,
+            has_embedded_alpha,
+            embedded_alpha,
+            alpha_source,
+            mask_prompt_required,
+        ),
+        mask_prompt_required=mask_prompt_required,
+    )
+
+
+def load_image(
+    image_path: str,
+    *,
+    alpha_mask_path: str | None = None,
+    auto_detect_mask: bool = False,
+):
+    """Load an image and return the legacy RGB / Oklch / valid-mask triple."""
+    loaded_image = load_image_data(
+        image_path,
+        alpha_mask_path=alpha_mask_path,
+        auto_detect_mask=auto_detect_mask,
+    )
+    return loaded_image.rgb_float, loaded_image.oklch_float, loaded_image.valid_mask
 
 
 def build_luma_preview_frame(
@@ -377,7 +640,7 @@ def build_luma_preview_lut(
 
 def apply_luma_preview_lut(
     y_index_image: np.ndarray,
-    valid_mask: np.ndarray,
+    valid_mask: np.ndarray | None,
     lut_uint8: np.ndarray,
     out_buf: np.ndarray | None = None,
 ) -> np.ndarray:
@@ -385,7 +648,8 @@ def apply_luma_preview_lut(
     if out_buf is None:
         out_buf = np.empty((*y_index_image.shape, 3), dtype=np.uint8)
     np.take(lut_uint8, y_index_image, axis=0, out=out_buf)
-    out_buf[~valid_mask] = 0
+    if valid_mask is not None:
+        out_buf[~valid_mask] = 0
     return out_buf
 
 
@@ -398,10 +662,11 @@ def count_luma_preview_gamut_pixels(
     return int(np.count_nonzero(valid_mask & compressed_entries[y_index_image]))
 
 
-def quantize_rgb_image(rgb_float: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
+def quantize_rgb_image(rgb_float: np.ndarray, valid_mask: np.ndarray | None = None) -> np.ndarray:
     """把浮点 RGB 图量化成 uint8，并对透明区域清零。"""
     rgb_uint8 = img_as_ubyte(np.clip(rgb_float, 0.0, 1.0))
-    rgb_uint8[~valid_mask] = 0
+    if valid_mask is not None:
+        rgb_uint8[~valid_mask] = 0
     return rgb_uint8
 
 
@@ -414,6 +679,7 @@ def normalize_luma_execution_request(request: LumaExecutionRequest) -> LumaExecu
     """补齐默认值并校验统一执行请求。"""
     normalized = LumaExecutionRequest(
         image_path=resolve_input_image_path(request.image_path),
+        alpha_mask_path=resolve_optional_path(request.alpha_mask_path, argument_name="alpha mask image"),
         curve_path=request.curve_path,
         algorithm=request.algorithm or "original",
         dither_strength=float(request.dither_strength),
@@ -447,6 +713,7 @@ def luma_request_from_payload(payload: dict) -> LumaExecutionRequest:
     return normalize_luma_execution_request(
         LumaExecutionRequest(
             image_path=payload.get("image_path"),
+            alpha_mask_path=payload.get("alpha_mask_path"),
             curve_path=payload.get("curve_path"),
             algorithm=algorithm,
             dither_strength=payload.get("dither_strength", DITHER_STRENGTH),
@@ -838,15 +1105,24 @@ def reconstruct_from_state_curves(
     valid_mask: np.ndarray,
     state_curves: StateCurveSet,
     dither_strength: float = DITHER_STRENGTH,
+    output_valid_mask: np.ndarray | None = None,
 ):
     """对抖动后的输入轴先求 Lt，再通过 Ct / ht 生成最终颜色状态。"""
+    if output_valid_mask is None:
+        output_valid_mask = valid_mask
+    else:
+        output_valid_mask = np.asarray(output_valid_mask, dtype=bool)
+        if output_valid_mask.shape != valid_mask.shape:
+            raise ValueError("output_valid_mask must match valid_mask shape")
+
     y_image = oklch_float[:, :, 0]
-    y_eval = apply_precurve_dither(y_image, valid_mask, dither_strength)
+    y_eval = apply_precurve_dither(y_image, output_valid_mask, dither_strength)
     lightness_eval, chroma_eval, hue_eval = evaluate_state_curves(state_curves, y_eval)
     reconstructed_oklch = np.stack([lightness_eval, chroma_eval, hue_eval], axis=-1)
-    reconstructed_oklch[~valid_mask] = 0.0
+    if not np.all(output_valid_mask):
+        reconstructed_oklch[~output_valid_mask] = 0.0
     adjusted_oklch, reconstructed_rgb, gamut_compressed_pixels = compress_oklch_chroma_to_srgb(
-        reconstructed_oklch, valid_mask
+        reconstructed_oklch, output_valid_mask
     )
     return reconstructed_rgb, adjusted_oklch, y_eval, gamut_compressed_pixels
 
@@ -882,7 +1158,11 @@ def evaluate_reconstruction(rgb_float, recolored_rgb_float, valid_mask):
 
 def run_original_luma_algorithm(request: LumaExecutionRequest) -> LumaExecutionResult:
     """执行原始高质量离线主流程。"""
-    rgb_float, oklch_float, valid_mask = load_image(request.image_path)
+    loaded_image = load_image_data(request.image_path, alpha_mask_path=request.alpha_mask_path)
+    rgb_float = loaded_image.rgb_float
+    oklch_float = loaded_image.oklch_float
+    valid_mask = loaded_image.valid_mask
+    output_valid_mask = np.ones_like(valid_mask, dtype=bool)
     model, y_samples = build_oklch_curve_model(oklch_float, valid_mask)
     curve_overrides = load_state_curve_overrides(request.curve_path)
     state_curves = build_state_curve_set(model, **curve_overrides)
@@ -891,8 +1171,9 @@ def run_original_luma_algorithm(request: LumaExecutionRequest) -> LumaExecutionR
         valid_mask,
         state_curves,
         dither_strength=request.dither_strength,
+        output_valid_mask=output_valid_mask,
     )
-    recolored_rgb_int = quantize_rgb_image(recolored_rgb_float, valid_mask)
+    recolored_rgb_int = quantize_rgb_image(recolored_rgb_float)
 
     psnr = None
     delta_e_image = None
@@ -907,6 +1188,7 @@ def run_original_luma_algorithm(request: LumaExecutionRequest) -> LumaExecutionR
     return LumaExecutionResult(
         algorithm="original",
         image_path=request.image_path,
+        alpha_mask_path=request.alpha_mask_path,
         curve_path=request.curve_path,
         dither_strength=request.dither_strength,
         source_image_shape=tuple(int(value) for value in rgb_float.shape[:2]),
@@ -922,6 +1204,8 @@ def run_original_luma_algorithm(request: LumaExecutionRequest) -> LumaExecutionR
         recolored_rgb_float=recolored_rgb_float,
         y_eval=y_eval,
         gamut_compressed_pixels=gamut_compressed_pixels,
+        alpha_source=loaded_image.alpha_source,
+        image_warnings=loaded_image.image_warnings,
         recolored_rgb_int=recolored_rgb_int,
         psnr=psnr,
         delta_e_image=delta_e_image,
@@ -931,7 +1215,10 @@ def run_original_luma_algorithm(request: LumaExecutionRequest) -> LumaExecutionR
 
 def run_fast_luma_algorithm(request: LumaExecutionRequest) -> LumaExecutionResult:
     """执行与未来 GUI 预览一致的快速 LUT 算法。"""
-    source_rgb_float, source_oklch_float, source_valid_mask = load_image(request.image_path)
+    loaded_image = load_image_data(request.image_path, alpha_mask_path=request.alpha_mask_path)
+    source_rgb_float = loaded_image.rgb_float
+    source_oklch_float = loaded_image.oklch_float
+    source_valid_mask = loaded_image.valid_mask
     model, y_samples = build_oklch_curve_model(source_oklch_float, source_valid_mask)
     curve_overrides = load_state_curve_overrides(request.curve_path)
     state_curves = build_state_curve_set(model, **curve_overrides)
@@ -942,13 +1229,17 @@ def run_fast_luma_algorithm(request: LumaExecutionRequest) -> LumaExecutionResul
         source_valid_mask,
         preview_scale=request.preview_scale,
     )
-    y_eval = apply_precurve_dither(preview_frame.y_image, preview_frame.valid_mask, request.dither_strength)
+    y_eval = apply_precurve_dither(
+        preview_frame.y_image,
+        np.ones_like(preview_frame.valid_mask, dtype=bool),
+        request.dither_strength,
+    )
     y_index = compute_luma_lut_indices(y_eval, request.preview_lut_size)
     preview_lut_uint8, compressed_entries = build_luma_preview_lut(
         state_curves,
         preview_lut_size=request.preview_lut_size,
     )
-    recolored_rgb_int = apply_luma_preview_lut(y_index, preview_frame.valid_mask, preview_lut_uint8)
+    recolored_rgb_int = apply_luma_preview_lut(y_index, None, preview_lut_uint8)
     recolored_rgb_float = img_as_float(recolored_rgb_int)
     gamut_compressed_pixels = count_luma_preview_gamut_pixels(
         y_index,
@@ -969,6 +1260,7 @@ def run_fast_luma_algorithm(request: LumaExecutionRequest) -> LumaExecutionResul
     return LumaExecutionResult(
         algorithm="fast",
         image_path=request.image_path,
+        alpha_mask_path=request.alpha_mask_path,
         curve_path=request.curve_path,
         dither_strength=request.dither_strength,
         source_image_shape=tuple(int(value) for value in source_rgb_float.shape[:2]),
@@ -984,6 +1276,8 @@ def run_fast_luma_algorithm(request: LumaExecutionRequest) -> LumaExecutionResul
         recolored_rgb_float=recolored_rgb_float,
         y_eval=y_eval,
         gamut_compressed_pixels=gamut_compressed_pixels,
+        alpha_source=loaded_image.alpha_source,
+        image_warnings=loaded_image.image_warnings,
         recolored_rgb_int=recolored_rgb_int,
         psnr=psnr,
         delta_e_image=delta_e_image,
@@ -1005,6 +1299,7 @@ def run_luma_workflow(request: LumaExecutionRequest) -> LumaExecutionResult:
 def run_luma_color_map(
     image_path: str | None = None,
     *,
+    alpha_mask_path: str | None = None,
     curve_path: str | None = None,
     dither_strength: float = DITHER_STRENGTH,
     evaluate_result: bool = True,
@@ -1016,6 +1311,7 @@ def run_luma_color_map(
     return run_luma_workflow(
         LumaExecutionRequest(
             image_path=image_path,
+            alpha_mask_path=alpha_mask_path,
             curve_path=curve_path,
             algorithm=algorithm,
             dither_strength=dither_strength,
@@ -1031,6 +1327,9 @@ def summarize_luma_result(result: LumaExecutionResult) -> dict:
     summary = {
         "algorithm": result.algorithm,
         "image_path": result.image_path,
+        "alpha_mask_path": result.alpha_mask_path,
+        "alpha_source": result.alpha_source,
+        "image_warnings": list(result.image_warnings),
         "curve_path": result.curve_path,
         "curve_source": result.curve_path or "default base-model controls",
         "dither_strength": float(result.dither_strength),
@@ -1067,12 +1366,16 @@ def write_luma_summary_json(result: LumaExecutionResult, output_path: str):
 
 
 __all__ = [
+    "ALPHA_VALID_EPSILON",
+    "AUTO_MASK_BORDER_WIDTH",
+    "AUTO_MASK_COLOR_TOLERANCE",
     "DATA_DIRECTORY",
     "DEFAULT_FAST_LUT_SIZE",
     "DEFAULT_FAST_PREVIEW_SCALE",
     "DEFAULT_SAMPLE_IMAGE_CANDIDATES",
     "DITHER_STRENGTH",
     "HUE_CHROMA_FLOOR",
+    "LoadedImageData",
     "LumaExecutionRequest",
     "LumaExecutionResult",
     "LumaPreviewFrame",
@@ -1092,6 +1395,7 @@ __all__ = [
     "compute_luma_lut_indices",
     "compute_oklab_max_saturation",
     "count_luma_preview_gamut_pixels",
+    "detect_auto_valid_mask",
     "evaluate_chroma_hue",
     "evaluate_reconstruction",
     "evaluate_state_curves",
@@ -1102,6 +1406,7 @@ __all__ = [
     "linear_srgb_to_oklab",
     "linear_to_srgb",
     "load_image",
+    "load_image_data",
     "load_luma_request_json",
     "load_state_curve_overrides",
     "luma_request_from_payload",

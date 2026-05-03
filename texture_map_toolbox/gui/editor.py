@@ -23,7 +23,7 @@ from texture_map_toolbox.core.luma import (
     compute_luma_lut_indices,
     count_luma_preview_gamut_pixels,
     evaluate_reconstruction,
-    load_image,
+    load_image_data,
     load_state_curve_overrides,
     prepare_control_points,
     reconstruct_from_state_curves,
@@ -97,6 +97,8 @@ class OklchCurveEditor:
         self.mask_small = self.preview_frame.valid_mask
         self.y_small = self.preview_frame.y_image
         self.y_small_index = compute_luma_lut_indices(self.y_small, PREVIEW_LUT_SIZE)
+        self._preview_output_mask = np.ones_like(self.mask_small, dtype=bool)
+        self._output_valid_mask = np.ones_like(self.valid_mask, dtype=bool)
         self._preview_buf = np.empty((*self.y_small.shape, 3), dtype=np.uint8)
 
     def _sample_initial_curves(self, initial_curve_overrides: dict):
@@ -255,7 +257,7 @@ class OklchCurveEditor:
             preview_y_index = self.y_small_index
         lut_uint8, gamut_pixels = self._build_preview_lut(state_curves, preview_y_index)
         mid = time.perf_counter()
-        apply_luma_preview_lut(preview_y_index, self.mask_small, lut_uint8, out_buf=self._preview_buf)
+        apply_luma_preview_lut(preview_y_index, self._preview_output_mask, lut_uint8, out_buf=self._preview_buf)
         recolor_done = time.perf_counter()
         self.preview_img.set_data(self._preview_buf)
 
@@ -291,7 +293,7 @@ class OklchCurveEditor:
         state_curves = self._last_state_curves or self._build_state_curves()
         recolored_rgb_float, _, y_eval, gamut_pixels = reconstruct_from_state_curves(
             self.oklch_float,
-            self.valid_mask,
+            self._output_valid_mask,
             state_curves,
             dither_strength=self.dither_strength,
         )
@@ -381,16 +383,20 @@ class OklchCurveEditor:
 def launch_editor(
     image_path: str | None,
     *,
+    alpha_mask_path: str | None = None,
     curve_path: str | None = None,
     curve_output_path: str | None = None,
     dither_strength: float = DITHER_STRENGTH,
 ) -> OklchCurveEditor:
     """构建并返回编辑器对象，供 CLI 或 GUI 复用。"""
     resolved_image_path = resolve_input_image_path(image_path)
-    rgb_float, oklch_float, valid_mask = load_image(resolved_image_path)
+    loaded_image = load_image_data(resolved_image_path, alpha_mask_path=alpha_mask_path)
+    rgb_float = loaded_image.rgb_float
+    oklch_float = loaded_image.oklch_float
+    valid_mask = loaded_image.valid_mask
     base_model, _ = build_oklch_curve_model(oklch_float, valid_mask)
     curve_overrides = load_state_curve_overrides(curve_path)
-    return OklchCurveEditor(
+    editor = OklchCurveEditor(
         resolved_image_path,
         rgb_float,
         oklch_float,
@@ -400,6 +406,10 @@ def launch_editor(
         dither_strength=dither_strength,
         curve_output_path=curve_output_path,
     )
+    editor.image_warnings = loaded_image.image_warnings
+    editor.alpha_source = loaded_image.alpha_source
+    editor.alpha_mask_path = loaded_image.alpha_mask_path
+    return editor
 
 
 __all__ = [
