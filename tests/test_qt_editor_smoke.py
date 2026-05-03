@@ -13,6 +13,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from texture_map_toolbox import __main__ as package_main
 from texture_map_toolbox.api.luma import resolve_input_image_path
 from texture_map_toolbox.cli import editor as editor_cli
+from texture_map_toolbox.core.luma import STATE_CURVE_CTRL_POINTS
 from texture_map_toolbox.gui.qt_editor import (
     QtTargetImagePickerDialog,
     _ensure_qt_application,
@@ -103,8 +104,22 @@ class QtEditorSmokeTests(unittest.TestCase):
             self.assertEqual(window.windowTitle(), "Texture-Map-Toolbox Qt MVP")
             self.assertEqual(window._preview_buf.shape[-1], 3)
             self.assertGreater(window.lightness_plot.control_item._positions.shape[0], 1)
-            self.assertGreater(window.chroma_plot.control_item._positions.shape[0], 1)
-            self.assertGreater(window.hue_plot.control_item._positions.shape[0], 1)
+            self.assertEqual(window.chroma_plot.control_item._positions.shape[0], STATE_CURVE_CTRL_POINTS)
+            self.assertEqual(window.hue_plot.control_item._positions.shape[0], STATE_CURVE_CTRL_POINTS)
+        finally:
+            window.close()
+
+    def test_qt_editor_defaults_use_sparse_handles_but_exact_baseline_curves(self):
+        window = build_qt_editor(SAMPLE_IMAGE)
+        try:
+            self.assertEqual(window.ctrl_x[1].size, STATE_CURVE_CTRL_POINTS)
+            self.assertEqual(window.ctrl_x[2].size, STATE_CURVE_CTRL_POINTS)
+            self.assertEqual(window.curve_point_count_spinboxes[1].value(), STATE_CURVE_CTRL_POINTS)
+            self.assertFalse(any(window._curve_override_enabled))
+
+            state_curves = window._build_state_curves()
+            self.assertEqual(state_curves.chroma_points.shape[0], window.base_model.key_y.size)
+            self.assertEqual(state_curves.hue_points.shape[0], window.base_model.key_y.size)
         finally:
             window.close()
 
@@ -144,17 +159,46 @@ class QtEditorSmokeTests(unittest.TestCase):
             window.apply_lightness_target_image(SAMPLE_IMAGE)
             self.assertIn("lightness", window.target_curve_image_paths)
             self.assertIsNotNone(window._lightness_reference_histogram)
+            self.assertTrue(window._curve_override_enabled[0])
+            self.assertEqual(window.ctrl_x[0].size, STATE_CURVE_CTRL_POINTS)
             self.assertTrue((window.ctrl_y[0][1:] - window.ctrl_y[0][:-1] >= -1e-12).all())
 
             window.apply_chroma_target_image(SAMPLE_IMAGE)
             self.assertIn("chroma", window.target_curve_image_paths)
-            self.assertTrue((window.ctrl_x[1] == window.base_model.key_y).all())
-            self.assertTrue((window.ctrl_y[1] == window.base_model.key_c).all())
+            self.assertTrue(window._curve_override_enabled[1])
+            self.assertEqual(window.ctrl_x[1].size, STATE_CURVE_CTRL_POINTS)
+            self.assertTrue(np.allclose(window.ctrl_x[1], np.linspace(0.0, 1.0, STATE_CURVE_CTRL_POINTS)))
 
             window.apply_hue_target_image(SAMPLE_IMAGE)
             self.assertIn("hue", window.target_curve_image_paths)
-            self.assertTrue((window.ctrl_x[2] == window.base_model.key_y).all())
-            self.assertTrue((window.ctrl_y[2] == window.base_model.key_h).all())
+            self.assertTrue(window._curve_override_enabled[2])
+            self.assertEqual(window.ctrl_x[2].size, STATE_CURVE_CTRL_POINTS)
+            self.assertTrue(np.allclose(window.ctrl_x[2], np.linspace(0.0, 1.0, STATE_CURVE_CTRL_POINTS)))
+        finally:
+            window.close()
+
+    def test_qt_editor_curve_controls_can_resample_drag_x_and_reset_default(self):
+        window = build_qt_editor(SAMPLE_IMAGE)
+        try:
+            window._set_curve_point_count(1, 6)
+            self.assertEqual(window.ctrl_x[1].size, 6)
+            self.assertEqual(window.curve_point_count_spinboxes[1].value(), 6)
+            self.assertFalse(window._curve_override_enabled[1])
+
+            edited_points = np.column_stack([window.ctrl_x[1], window.ctrl_y[1]])
+            edited_points[2, 0] = 0.42
+            edited_points[2, 1] = edited_points[2, 1] + 0.05
+            window._on_curve_points_changed(1, edited_points)
+
+            self.assertTrue(window._curve_override_enabled[1])
+            self.assertAlmostEqual(window.ctrl_x[1][2], 0.42, places=6)
+            self.assertEqual(window._build_state_curves().chroma_points.shape[0], 6)
+
+            window._reset_curve_to_default(1)
+
+            self.assertFalse(window._curve_override_enabled[1])
+            self.assertEqual(window.ctrl_x[1].size, 6)
+            self.assertEqual(window._build_state_curves().chroma_points.shape[0], window.base_model.key_y.size)
         finally:
             window.close()
 

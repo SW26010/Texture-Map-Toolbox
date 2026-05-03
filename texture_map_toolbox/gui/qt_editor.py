@@ -54,6 +54,16 @@ CURVE_BACKGROUND_HEIGHT = 256
 LIGHTNESS_HISTOGRAM_BINS = 96
 CURVE_X_DENSE = np.linspace(0.0, 1.0, CURVE_LINE_SAMPLES)
 PIL_PREVIEW_RESAMPLE = Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS
+CURVE_EDITOR_MIN_CTRL_POINTS = 2
+CURVE_EDITOR_MAX_CTRL_POINTS = 512
+CURVE_EDITOR_OVERRIDE_KEYS = (
+    "lightness_control_points",
+    "chroma_control_points",
+    "hue_control_points",
+)
+CURVE_EDITOR_SAVE_KEYS = ("lightness", "chroma", "hue")
+CURVE_EDITOR_MODE_DEFAULT = "Original curve active"
+CURVE_EDITOR_MODE_EDITED = "Editable key points active"
 MASK_COLOR_TOLERANCE_MAX = 64
 MASK_REGION_OFFSET_MIN = -64
 MASK_REGION_OFFSET_MAX = 64
@@ -1295,9 +1305,12 @@ class QtSeedMaskSelectionDialog(QtWidgets.QDialog):
 
 
 class DraggableCurveGraph(pg.GraphItem):
-    """A fixed-x draggable control-point polyline."""
+    """A draggable control-point polyline with ordered x positions."""
 
     sigControlPointsChanged = QtCore.Signal(object)
+    sigControlPointPositionsChanged = QtCore.Signal(object)
+
+    _X_DRAG_MARGIN = 1e-3
 
     def __init__(self, fixed_x: np.ndarray, y_min: float, y_max: float, pen, brush):
         super().__init__()
@@ -1305,26 +1318,37 @@ class DraggableCurveGraph(pg.GraphItem):
         self._y_max = float(y_max)
         self._pen = pen
         self._brush = brush
-        self._fixed_x = np.asarray(fixed_x, dtype=np.float64)
-        self._adj = _build_polyline_adjacency(self._fixed_x.size)
-        self._point_data = np.arange(self._fixed_x.size, dtype=np.int32)
-        self._positions = np.column_stack([self._fixed_x, np.zeros_like(self._fixed_x)])
+        self._adj = np.empty((0, 2), dtype=np.int32)
+        self._point_data = np.empty(0, dtype=np.int32)
+        self._positions = np.empty((0, 2), dtype=np.float64)
         self._drag_index: int | None = None
         self._drag_offset = pg.Point(0.0, 0.0)
-        self._update_graph()
+        self.set_points(fixed_x, np.zeros_like(np.asarray(fixed_x, dtype=np.float64)))
 
     def set_points(self, x_values: np.ndarray, y_values: np.ndarray):
         """Replace the draggable control points."""
-        self._fixed_x = np.asarray(x_values, dtype=np.float64)
+        x_values = np.asarray(x_values, dtype=np.float64)
         y_values = np.asarray(y_values, dtype=np.float64)
-        self._adj = _build_polyline_adjacency(self._fixed_x.size)
-        self._point_data = np.arange(self._fixed_x.size, dtype=np.int32)
-        self._positions = np.column_stack([self._fixed_x, y_values])
+        if x_values.ndim != 1 or y_values.ndim != 1 or x_values.size != y_values.size:
+            raise ValueError("control points must be parallel 1D x/y arrays")
+        if x_values.size < 2:
+            raise ValueError("at least two control points are required")
+
+        sort_indices = np.argsort(x_values, kind="stable")
+        x_values = np.clip(x_values[sort_indices], 0.0, 1.0)
+        y_values = y_values[sort_indices]
+        self._adj = _build_polyline_adjacency(x_values.size)
+        self._point_data = np.arange(x_values.size, dtype=np.int32)
+        self._positions = np.column_stack([x_values, y_values])
         self._update_graph()
 
     def set_y_values(self, y_values: np.ndarray):
         """Replace the draggable control-point y values."""
-        self.set_points(self._fixed_x, y_values)
+        self.set_points(self._positions[:, 0], y_values)
+
+    def positions(self) -> np.ndarray:
+        """Return a copy of the current control-point positions."""
+        return np.array(self._positions, copy=True)
 
     def set_y_range(self, y_min: float, y_max: float):
         """Update the vertical clamp range used during dragging."""
@@ -1346,7 +1370,7 @@ class DraggableCurveGraph(pg.GraphItem):
         )
 
     def mouseDragEvent(self, event):
-        """Drag a control point vertically while keeping x fixed."""
+        """Drag a control point while preserving sorted x order."""
         if event.button() != QtCore.Qt.MouseButton.LeftButton:
             event.ignore()
             return
@@ -1366,12 +1390,31 @@ class DraggableCurveGraph(pg.GraphItem):
             return
 
         new_position = event.pos() + self._drag_offset
+        new_x = self._constrain_drag_x(self._drag_index, float(new_position.x()))
         new_y = float(np.clip(new_position.y(), self._y_min, self._y_max))
-        self._positions[self._drag_index, 0] = self._fixed_x[self._drag_index]
+        self._positions[self._drag_index, 0] = new_x
         self._positions[self._drag_index, 1] = new_y
         self._update_graph()
         self.sigControlPointsChanged.emit(self._positions[:, 1].copy())
+        self.sigControlPointPositionsChanged.emit(self.positions())
         event.accept()
+
+    def _constrain_drag_x(self, index: int, proposed_x: float) -> float:
+        """Clamp one point's x so interior points never cross their neighbors."""
+        point_count = int(self._positions.shape[0])
+        if point_count < 2:
+            return float(np.clip(proposed_x, 0.0, 1.0))
+        if index <= 0:
+            return float(self._positions[0, 0])
+        if index >= point_count - 1:
+            return float(self._positions[-1, 0])
+
+        left_x = float(self._positions[index - 1, 0]) + self._X_DRAG_MARGIN
+        right_x = float(self._positions[index + 1, 0]) - self._X_DRAG_MARGIN
+        if right_x <= left_x:
+            midpoint = 0.5 * (left_x + right_x)
+            return float(np.clip(midpoint, 0.0, 1.0))
+        return float(np.clip(proposed_x, left_x, right_x))
 
 
 class CurvePlotWidget(pg.PlotWidget):
@@ -1511,6 +1554,7 @@ class QtOklchCurveEditorWindow(QtWidgets.QMainWindow):
         self._last_target_image_dialog_path = self.image_path
         self._last_target_mask_dialog_path: str | None = None
         self._last_target_mask_mode = "image-alpha"
+        self._default_curve_lines = self._build_default_curve_lines()
 
         self._build_preview_inputs()
         self._initialize_controls(initial_curve_overrides or {})
@@ -1539,28 +1583,195 @@ class QtOklchCurveEditorWindow(QtWidgets.QMainWindow):
         self._preview_buf = np.empty((*self.y_small.shape, 3), dtype=np.uint8)
         self._original_display_uint8 = _rgb_float_to_uint8(self.preview_frame.rgb_float)
 
+    def _build_default_curve_lines(self) -> list[np.ndarray]:
+        """Build the exact baseline curves shown by the dashed reference lines."""
+        lightness_line = np.array(CURVE_X_DENSE, copy=True)
+        chroma_line = np.clip(self.base_model.c_interp(CURVE_X_DENSE), 0.0, None)
+        hue_line = _evaluate_hue_curve(self.base_model.u_interp, self.base_model.v_interp, CURVE_X_DENSE)
+        return [lightness_line, chroma_line, hue_line]
+
+    def _sample_default_curve_points(self, curve_index: int, point_count: int | None = None) -> np.ndarray:
+        """Sample sparse editor control points from the exact baseline curve."""
+        resolved_count = max(CURVE_EDITOR_MIN_CTRL_POINTS, int(point_count or STATE_CURVE_CTRL_POINTS))
+        x_values = np.linspace(0.0, 1.0, resolved_count, dtype=np.float64)
+        if curve_index == 0:
+            y_values = np.array(x_values, copy=True)
+        elif curve_index == 1:
+            y_values = np.clip(self.base_model.c_interp(x_values), 0.0, None)
+        else:
+            y_values = _evaluate_hue_curve(self.base_model.u_interp, self.base_model.v_interp, x_values)
+        return np.column_stack([x_values, y_values])
+
+    def _prepare_curve_control_points(
+        self,
+        curve_index: int,
+        control_points: np.ndarray,
+        *,
+        default_points: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Normalize one curve's control points and keep endpoints anchored to the full domain."""
+        fallback_points = np.asarray(
+            default_points if default_points is not None else self._sample_default_curve_points(curve_index),
+            dtype=np.float64,
+        )
+        if curve_index == 0:
+            points = prepare_control_points(
+                control_points,
+                fallback_points[:, 0],
+                fallback_points[:, 1],
+                clip_min=0.0,
+                clip_max=1.0,
+            )
+        elif curve_index == 1:
+            points = prepare_control_points(
+                control_points,
+                fallback_points[:, 0],
+                fallback_points[:, 1],
+                clip_min=0.0,
+            )
+        else:
+            points = prepare_control_points(
+                control_points,
+                fallback_points[:, 0],
+                fallback_points[:, 1],
+                wrap_degrees=True,
+            )
+
+        points = np.array(points, copy=True)
+        points[0, 0] = 0.0
+        points[-1, 0] = 1.0
+        return points
+
+    def _sample_effective_curve_values(
+        self,
+        curve_index: int,
+        x_values: np.ndarray,
+        state_curves=None,
+    ) -> np.ndarray:
+        """Sample one curve from the currently effective state-curve set."""
+        resolved_state_curves = state_curves or self._build_state_curves()
+        x_values = np.clip(np.asarray(x_values, dtype=np.float64), 0.0, 1.0)
+        if curve_index == 0:
+            return np.clip(resolved_state_curves.lightness_interp(x_values), 0.0, 1.0)
+        if curve_index == 1:
+            return np.clip(resolved_state_curves.chroma_interp(x_values), 0.0, None)
+        return _evaluate_hue_curve(resolved_state_curves.hue_u_interp, resolved_state_curves.hue_v_interp, x_values)
+
+    def _build_curve_panel(self, curve_index: int, plot_widget: CurvePlotWidget) -> QtWidgets.QWidget:
+        """Wrap one plot with point-count and reset controls."""
+        panel = QtWidgets.QWidget()
+        panel_layout = QtWidgets.QVBoxLayout(panel)
+        panel_layout.setContentsMargins(0, 0, 0, 0)
+        panel_layout.setSpacing(6)
+
+        controls_layout = QtWidgets.QHBoxLayout()
+        controls_layout.setContentsMargins(0, 0, 0, 0)
+        controls_layout.setSpacing(8)
+
+        points_label = QtWidgets.QLabel("Key Points")
+        points_spin_box = QtWidgets.QSpinBox()
+        points_spin_box.setRange(CURVE_EDITOR_MIN_CTRL_POINTS, CURVE_EDITOR_MAX_CTRL_POINTS)
+        points_spin_box.setValue(int(self.ctrl_x[curve_index].size))
+        points_spin_box.setToolTip("Change how many sparse key points are exposed for this curve.")
+
+        reset_button = QtWidgets.QPushButton("Reset to Default")
+        reset_button.setToolTip("Use the original baseline curve again, ignoring the current sparse key-point approximation.")
+
+        mode_label = QtWidgets.QLabel()
+        mode_label.setStyleSheet("color: #aaaaaa;")
+
+        controls_layout.addWidget(points_label)
+        controls_layout.addWidget(points_spin_box)
+        controls_layout.addWidget(reset_button)
+        controls_layout.addStretch(1)
+        controls_layout.addWidget(mode_label)
+
+        panel_layout.addLayout(controls_layout)
+        panel_layout.addWidget(plot_widget, 1)
+
+        points_spin_box.valueChanged.connect(
+            lambda value, idx=curve_index: self._set_curve_point_count(idx, value)
+        )
+        reset_button.clicked.connect(
+            lambda _checked=False, idx=curve_index: self._reset_curve_to_default(idx)
+        )
+
+        self.curve_point_count_spinboxes.append(points_spin_box)
+        self.curve_reset_buttons.append(reset_button)
+        self.curve_mode_labels.append(mode_label)
+        self._sync_curve_editor_controls(curve_index)
+        return panel
+
+    def _sync_curve_editor_controls(self, curve_index: int):
+        """Keep the point-count widgets and mode labels aligned with the current curve state."""
+        if not hasattr(self, "curve_point_count_spinboxes") or curve_index >= len(self.curve_point_count_spinboxes):
+            return
+
+        point_count_spin_box = self.curve_point_count_spinboxes[curve_index]
+        blocker = QtCore.QSignalBlocker(point_count_spin_box)
+        point_count_spin_box.setValue(int(self.ctrl_x[curve_index].size))
+        del blocker
+
+        mode_label = self.curve_mode_labels[curve_index]
+        if self._curve_override_enabled[curve_index]:
+            mode_label.setText(CURVE_EDITOR_MODE_EDITED)
+            mode_label.setStyleSheet("color: #d7d7d7;")
+        else:
+            mode_label.setText(CURVE_EDITOR_MODE_DEFAULT)
+            mode_label.setStyleSheet("color: #8fe388;")
+
+    def _set_curve_point_count(self, curve_index: int, point_count: int):
+        """Resample the visible key points to a requested sparse count."""
+        resolved_count = max(CURVE_EDITOR_MIN_CTRL_POINTS, int(point_count))
+        current_count = int(self.ctrl_x[curve_index].size)
+        if resolved_count == current_count:
+            self._sync_curve_editor_controls(curve_index)
+            return
+
+        x_values = np.linspace(0.0, 1.0, resolved_count, dtype=np.float64)
+        if self._curve_override_enabled[curve_index]:
+            state_curves = self._last_state_curves or self._build_state_curves()
+            y_values = self._sample_effective_curve_values(curve_index, x_values, state_curves=state_curves)
+            override_enabled = True
+        else:
+            default_points = self._sample_default_curve_points(curve_index, resolved_count)
+            y_values = default_points[:, 1]
+            override_enabled = False
+
+        self._apply_control_points(
+            curve_index,
+            np.column_stack([x_values, y_values]),
+            rerender=True,
+            override_enabled=override_enabled,
+        )
+
+    def _reset_curve_to_default(self, curve_index: int):
+        """Revert one curve back to the exact default baseline while keeping sparse handles visible."""
+        default_points = self._sample_default_curve_points(curve_index, self.ctrl_x[curve_index].size)
+        self._apply_control_points(
+            curve_index,
+            default_points,
+            rerender=True,
+            override_enabled=False,
+        )
+
     def _sample_initial_curves(self, initial_curve_overrides: dict):
-        default_lightness_x = np.linspace(0.0, 1.0, STATE_CURVE_CTRL_POINTS)
-        default_lightness_points = prepare_control_points(
-            initial_curve_overrides.get("lightness_control_points"),
-            default_lightness_x,
-            default_lightness_x,
-            clip_min=0.0,
-            clip_max=1.0,
-        )
-        default_chroma_points = prepare_control_points(
-            initial_curve_overrides.get("chroma_control_points"),
-            self.base_model.key_y,
-            self.base_model.key_c,
-            clip_min=0.0,
-        )
-        default_hue_points = prepare_control_points(
-            initial_curve_overrides.get("hue_control_points"),
-            self.base_model.key_y,
-            self.base_model.key_h,
-            wrap_degrees=True,
-        )
-        return default_lightness_points, default_chroma_points, default_hue_points
+        sampled_points: list[np.ndarray] = []
+        self._curve_override_enabled = []
+        for curve_index, override_key in enumerate(CURVE_EDITOR_OVERRIDE_KEYS):
+            override_points = initial_curve_overrides.get(override_key)
+            if override_points is None:
+                sampled_points.append(self._sample_default_curve_points(curve_index, STATE_CURVE_CTRL_POINTS))
+                self._curve_override_enabled.append(False)
+                continue
+
+            override_points = np.asarray(override_points, dtype=np.float64)
+            default_points = self._sample_default_curve_points(curve_index, override_points.shape[0])
+            sampled_points.append(
+                self._prepare_curve_control_points(curve_index, override_points, default_points=default_points)
+            )
+            self._curve_override_enabled.append(True)
+        return tuple(sampled_points)
 
     def _initialize_controls(self, initial_curve_overrides: dict):
         lightness_points, chroma_points, hue_points = self._sample_initial_curves(initial_curve_overrides)
@@ -1571,11 +1782,13 @@ class QtOklchCurveEditorWindow(QtWidgets.QMainWindow):
         self.chroma_ylim = (0.0, max(0.35, float(base_chroma_max) * 1.25))
 
     def _current_control_point_payload(self) -> dict:
-        return {
-            "lightness_control_points": np.column_stack([self.ctrl_x[0], self.ctrl_y[0]]),
-            "chroma_control_points": np.column_stack([self.ctrl_x[1], self.ctrl_y[1]]),
-            "hue_control_points": np.column_stack([self.ctrl_x[2], self.ctrl_y[2]]),
-        }
+        payload = {}
+        for curve_index, override_key in enumerate(CURVE_EDITOR_OVERRIDE_KEYS):
+            if self._curve_override_enabled[curve_index]:
+                payload[override_key] = np.column_stack([self.ctrl_x[curve_index], self.ctrl_y[curve_index]])
+            else:
+                payload[override_key] = None
+        return payload
 
     def _build_state_curves(self):
         return build_state_curve_set(self.base_model, **self._current_control_point_payload())
@@ -1625,6 +1838,9 @@ class QtOklchCurveEditorWindow(QtWidgets.QMainWindow):
         curves_layout = QtWidgets.QVBoxLayout(curves_widget)
         curves_layout.setContentsMargins(0, 0, 0, 0)
         curves_layout.setSpacing(10)
+        self.curve_point_count_spinboxes: list[QtWidgets.QSpinBox] = []
+        self.curve_reset_buttons: list[QtWidgets.QPushButton] = []
+        self.curve_mode_labels: list[QtWidgets.QLabel] = []
 
         self.lightness_plot = CurvePlotWidget(
             title="Lightness Transfer Lt(y)",
@@ -1654,13 +1870,13 @@ class QtOklchCurveEditorWindow(QtWidgets.QMainWindow):
             point_brush=pg.mkBrush("#ff6b57"),
         )
 
-        self.lightness_plot.set_default_line(CURVE_X_DENSE)
-        self.chroma_plot.set_default_line(None)
-        self.hue_plot.set_default_line(None)
+        self.lightness_plot.set_default_line(self._default_curve_lines[0])
+        self.chroma_plot.set_default_line(self._default_curve_lines[1])
+        self.hue_plot.set_default_line(self._default_curve_lines[2])
 
-        curves_layout.addWidget(self.lightness_plot, 1)
-        curves_layout.addWidget(self.chroma_plot, 1)
-        curves_layout.addWidget(self.hue_plot, 1)
+        curves_layout.addWidget(self._build_curve_panel(0, self.lightness_plot), 1)
+        curves_layout.addWidget(self._build_curve_panel(1, self.chroma_plot), 1)
+        curves_layout.addWidget(self._build_curve_panel(2, self.hue_plot), 1)
 
         images_widget = QtWidgets.QWidget()
         images_layout = QtWidgets.QHBoxLayout(images_widget)
@@ -1685,23 +1901,27 @@ class QtOklchCurveEditorWindow(QtWidgets.QMainWindow):
 
         self.original_image_label.set_rgb_uint8(self._original_display_uint8)
 
-        self.lightness_plot.control_item.sigControlPointsChanged.connect(
-            lambda values: self._on_curve_points_changed(0, values)
+        self.lightness_plot.control_item.sigControlPointPositionsChanged.connect(
+            lambda positions: self._on_curve_points_changed(0, positions)
         )
-        self.chroma_plot.control_item.sigControlPointsChanged.connect(
-            lambda values: self._on_curve_points_changed(1, values)
+        self.chroma_plot.control_item.sigControlPointPositionsChanged.connect(
+            lambda positions: self._on_curve_points_changed(1, positions)
         )
-        self.hue_plot.control_item.sigControlPointsChanged.connect(
-            lambda values: self._on_curve_points_changed(2, values)
+        self.hue_plot.control_item.sigControlPointPositionsChanged.connect(
+            lambda positions: self._on_curve_points_changed(2, positions)
         )
         self.save_button.clicked.connect(self._save_curves)
         self.render_button.clicked.connect(self._render_full_resolution)
         self.load_target_picker_button.clicked.connect(self._open_target_image_picker)
 
-    def _on_curve_points_changed(self, curve_index: int, y_values: np.ndarray):
+    def _on_curve_points_changed(self, curve_index: int, control_points: np.ndarray):
         """Update one curve from dragged control points and rerender."""
-        self.ctrl_y[curve_index] = np.asarray(y_values, dtype=np.float64)
-        self._render_preview()
+        self._apply_control_points(
+            curve_index,
+            np.asarray(control_points, dtype=np.float64),
+            rerender=True,
+            override_enabled=True,
+        )
 
     def _show_error(self, title: str, message: str):
         """Display a blocking Qt error dialog and mirror it in the status bar."""
@@ -1740,14 +1960,32 @@ class QtOklchCurveEditorWindow(QtWidgets.QMainWindow):
         target_lightness_samples = loaded_image.oklch_float[loaded_image.valid_mask, 0]
         return loaded_image, target_model, target_lightness_samples
 
-    def _apply_control_points(self, curve_index: int, control_points: np.ndarray, *, rerender: bool = True):
-        """Replace one curve's control points and refresh the preview."""
-        self.ctrl_x[curve_index] = np.asarray(control_points[:, 0], dtype=np.float64)
-        self.ctrl_y[curve_index] = np.asarray(control_points[:, 1], dtype=np.float64)
+    def _apply_control_points(
+        self,
+        curve_index: int,
+        control_points: np.ndarray,
+        *,
+        rerender: bool = True,
+        override_enabled: bool | None = True,
+    ):
+        """Replace one curve's control points, optionally toggling default-curve mode."""
+        control_points = np.asarray(control_points, dtype=np.float64)
+        default_points = self._sample_default_curve_points(curve_index, control_points.shape[0])
+        normalized_points = self._prepare_curve_control_points(
+            curve_index,
+            control_points,
+            default_points=default_points,
+        )
+        self.ctrl_x[curve_index] = np.asarray(normalized_points[:, 0], dtype=np.float64)
+        self.ctrl_y[curve_index] = np.asarray(normalized_points[:, 1], dtype=np.float64)
+        if override_enabled is not None:
+            self._curve_override_enabled[curve_index] = bool(override_enabled)
         if curve_index == 1:
             chroma_max = max(float(np.max(self.ctrl_y[1])), float(np.max(self.base_model.key_c)), 1e-3)
             self.chroma_ylim = (0.0, max(0.35, chroma_max * 1.25))
-            self.chroma_plot.set_y_range(self.chroma_ylim)
+            if hasattr(self, "chroma_plot"):
+                self.chroma_plot.set_y_range(self.chroma_ylim)
+        self._sync_curve_editor_controls(curve_index)
         if rerender:
             self._render_preview()
 
@@ -1789,38 +2027,48 @@ class QtOklchCurveEditorWindow(QtWidgets.QMainWindow):
 
         applied_labels: list[str] = []
         if apply_lightness:
-            lightness_points = fit_monotonic_lightness_transfer_curve(
+            lightness_point_count = int(self.ctrl_x[0].size)
+            fitted_lightness_points = fit_monotonic_lightness_transfer_curve(
                 self.source_lightness_samples,
                 target_lightness_samples,
+                quantile_count=lightness_point_count,
             )
+            lightness_x = np.linspace(0.0, 1.0, lightness_point_count, dtype=np.float64)
+            lightness_interp = PchipInterpolator(
+                fitted_lightness_points[:, 0],
+                fitted_lightness_points[:, 1],
+                extrapolate=True,
+            )
+            lightness_points = np.column_stack([
+                lightness_x,
+                np.clip(lightness_interp(lightness_x), 0.0, 1.0),
+            ])
             self.target_curve_image_paths["lightness"] = loaded_image.image_path
             self.target_curve_mask_paths["lightness"] = loaded_image.alpha_mask_path
             self._lightness_reference_histogram = self._build_lightness_histogram(target_lightness_samples)
-            self._apply_control_points(0, lightness_points, rerender=False)
+            self._apply_control_points(0, lightness_points, rerender=False, override_enabled=True)
             applied_labels.append("L")
 
         if apply_chroma:
-            chroma_points = prepare_control_points(
-                np.column_stack([target_model.key_y, target_model.key_c]),
-                target_model.key_y,
-                target_model.key_c,
-                clip_min=0.0,
-            )
+            chroma_x = np.linspace(0.0, 1.0, int(self.ctrl_x[1].size), dtype=np.float64)
+            chroma_points = np.column_stack([
+                chroma_x,
+                np.clip(target_model.c_interp(chroma_x), 0.0, None),
+            ])
             self.target_curve_image_paths["chroma"] = loaded_image.image_path
             self.target_curve_mask_paths["chroma"] = loaded_image.alpha_mask_path
-            self._apply_control_points(1, chroma_points, rerender=False)
+            self._apply_control_points(1, chroma_points, rerender=False, override_enabled=True)
             applied_labels.append("C")
 
         if apply_hue:
-            hue_points = prepare_control_points(
-                np.column_stack([target_model.key_y, target_model.key_h]),
-                target_model.key_y,
-                target_model.key_h,
-                wrap_degrees=True,
-            )
+            hue_x = np.linspace(0.0, 1.0, int(self.ctrl_x[2].size), dtype=np.float64)
+            hue_points = np.column_stack([
+                hue_x,
+                _evaluate_hue_curve(target_model.u_interp, target_model.v_interp, hue_x),
+            ])
             self.target_curve_image_paths["hue"] = loaded_image.image_path
             self.target_curve_mask_paths["hue"] = loaded_image.alpha_mask_path
-            self._apply_control_points(2, hue_points, rerender=False)
+            self._apply_control_points(2, hue_points, rerender=False, override_enabled=True)
             applied_labels.append("H")
 
         self._render_preview()
@@ -1988,11 +2236,11 @@ class QtOklchCurveEditorWindow(QtWidgets.QMainWindow):
 
     def _save_curves(self):
         """Export the current Lt/Ct/ht control points to JSON."""
-        payload = {
-            "lightness": np.column_stack([self.ctrl_x[0], self.ctrl_y[0]]).tolist(),
-            "chroma": np.column_stack([self.ctrl_x[1], self.ctrl_y[1]]).tolist(),
-            "hue": np.column_stack([self.ctrl_x[2], self.ctrl_y[2]]).tolist(),
-        }
+        payload = {}
+        for curve_index, save_key in enumerate(CURVE_EDITOR_SAVE_KEYS):
+            if not self._curve_override_enabled[curve_index]:
+                continue
+            payload[save_key] = np.column_stack([self.ctrl_x[curve_index], self.ctrl_y[curve_index]]).tolist()
         with open(self.curve_output_path, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, ensure_ascii=False, indent=2)
             handle.write("\n")
