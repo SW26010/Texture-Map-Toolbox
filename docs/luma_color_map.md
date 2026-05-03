@@ -87,10 +87,45 @@
    - `original`: 原始离线高质量主流程
    - `fast`: 与未来 GUI 共用的快速 LUT 预览算法
 
+### Lightness 转换曲线拟合
+
+当前新增了一个专门针对 `L_t(y)` 的单调拟合 helper：
+
+- `fit_monotonic_lightness_transfer_curve(source_lightness, target_lightness, quantile_count=256)`
+
+它接收两组 `Lightness` 浮点样本，数量可以不同，并基于经验 CDF / quantile matching 拟合一条单调转换曲线：
+
+$$L_t(y) \approx F_{target}^{-1}(F_{source}(y))$$
+
+返回值是可直接复用到现有状态曲线体系里的 `[[x, y], ...]` 控制点，也就是 `lightness_control_points`。这比直接拟合多项式更稳，也更符合“让变换后的源分布尽量贴近目标分布”的目标。
+
+示例：
+
+```python
+from texture_map_toolbox.api.luma import fit_monotonic_lightness_transfer_curve
+
+lightness_points = fit_monotonic_lightness_transfer_curve(
+   source_lightness,
+   target_lightness,
+   quantile_count=256,
+)
+```
+
+如果你已经有一份曲线 JSON，也可以把返回值直接写到其中的 `lightness` 字段。
+
 推荐从 API 层直接集成：
 
 ```python
-from texture_map_toolbox.api.luma import LumaExecutionRequest, run_luma_workflow
+from texture_map_toolbox.api.luma import (
+   LumaExecutionRequest,
+   fit_monotonic_lightness_transfer_curve,
+   run_luma_workflow,
+)
+
+lightness_points = fit_monotonic_lightness_transfer_curve(
+   source_lightness,
+   target_lightness,
+)
 
 result = run_luma_workflow(
    LumaExecutionRequest(
@@ -168,11 +203,12 @@ python -m texture_map_toolbox luma path/to/image.png --algorithm original --curv
 - CLI 参数和 request JSON
 - matplotlib 绘图 helper
 - 编辑器初始化、导出和全分辨率重建
+- Lightness 单调分布拟合
 
 运行方式：
 
 ```bash
-python -m unittest tests.test_luma_smoke
+python -m unittest tests.test_luma_smoke tests.test_lightness_transfer_curve
 ```
 
 JSON 顶层是一个对象，可包含以下键：

@@ -586,6 +586,86 @@ def prepare_control_points(
     return points
 
 
+def _prepare_lightness_sample_array(
+    lightness_values: np.ndarray,
+    *,
+    arg_name: str,
+) -> np.ndarray:
+    """Normalize a lightness sample array into a clipped 1D float64 vector."""
+    values = np.asarray(lightness_values, dtype=np.float64).reshape(-1)
+    if values.size == 0:
+        raise ValueError(f"{arg_name} must contain at least one value")
+    if not np.all(np.isfinite(values)):
+        raise ValueError(f"{arg_name} must contain only finite values")
+    return np.clip(values, 0.0, 1.0)
+
+
+def _collapse_lightness_transfer_points(control_points: np.ndarray) -> np.ndarray:
+    """Collapse duplicate x positions while preserving a non-decreasing y mapping."""
+    unique_x, inverse = np.unique(control_points[:, 0], return_inverse=True)
+    unique_y = np.zeros(unique_x.shape[0], dtype=np.float64)
+    counts = np.bincount(inverse)
+    np.add.at(unique_y, inverse, control_points[:, 1])
+    unique_y /= counts
+    unique_y = np.maximum.accumulate(np.clip(unique_y, 0.0, 1.0))
+    return np.column_stack([unique_x, unique_y])
+
+
+def fit_monotonic_lightness_transfer_curve(
+    source_lightness: np.ndarray,
+    target_lightness: np.ndarray,
+    *,
+    quantile_count: int = MIN_KEYPOINTS,
+) -> np.ndarray:
+    """Fit monotonic Lt(y) control points by matching source and target empirical CDFs.
+
+    The returned control points can be passed directly as `lightness_control_points`
+    to `build_state_curve_set(...)` or serialized into the existing curve JSON format.
+    """
+    if quantile_count < 2:
+        raise ValueError("quantile_count must be at least 2")
+
+    source_values = _prepare_lightness_sample_array(
+        source_lightness,
+        arg_name="source_lightness",
+    )
+    target_values = _prepare_lightness_sample_array(
+        target_lightness,
+        arg_name="target_lightness",
+    )
+
+    quantiles = np.linspace(0.0, 1.0, int(quantile_count))
+    source_quantiles = np.quantile(source_values, quantiles)
+    target_quantiles = np.quantile(target_values, quantiles)
+    control_points = np.column_stack([source_quantiles, target_quantiles])
+
+    if control_points[0, 0] > 0.0:
+        control_points = np.vstack([
+            np.array([[0.0, target_quantiles[0]]], dtype=np.float64),
+            control_points,
+        ])
+    if control_points[-1, 0] < 1.0:
+        control_points = np.vstack([
+            control_points,
+            np.array([[1.0, target_quantiles[-1]]], dtype=np.float64),
+        ])
+
+    control_points = _collapse_lightness_transfer_points(control_points)
+    if control_points.shape[0] < 2:
+        control_points = np.array(
+            [[0.0, target_quantiles[0]], [1.0, target_quantiles[-1]]],
+            dtype=np.float64,
+        )
+
+    return prepare_control_points(
+        control_points,
+        control_points[:, 0],
+        control_points[:, 1],
+        clip_min=0.0,
+        clip_max=1.0,
+    )
+
+
 def build_state_curve_set(
     base_model: OklchCurveModel,
     control_point_count: int = STATE_CURVE_CTRL_POINTS,
@@ -998,6 +1078,7 @@ __all__ = [
     "extract_quantile_keypoints",
     "find_oklab_cusp",
     "find_oklab_gamut_intersection_preserve_lightness",
+    "fit_monotonic_lightness_transfer_curve",
     "linear_srgb_to_oklab",
     "linear_to_srgb",
     "load_image",
