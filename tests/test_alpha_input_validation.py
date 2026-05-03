@@ -48,6 +48,12 @@ class AlphaInputValidationTests(unittest.TestCase):
         rgb[2:6, 2:6] = np.array([220, 140, 60], dtype=np.uint8)
         Image.fromarray(rgb, mode="RGB").save(path)
 
+    def _write_multi_seed_mask_source(self, path: Path):
+        rgb = np.full((8, 8, 3), 220, dtype=np.uint8)
+        rgb[0:2, 0:2] = np.array([10, 10, 10], dtype=np.uint8)
+        rgb[0:2, 6:8] = np.array([40, 40, 40], dtype=np.uint8)
+        Image.fromarray(rgb, mode="RGB").save(path)
+
     def test_png_with_fully_opaque_alpha_emits_warning(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             image_path = Path(temp_dir) / "opaque.png"
@@ -97,6 +103,45 @@ class AlphaInputValidationTests(unittest.TestCase):
             self.assertFalse(loaded_image.valid_mask[0, 0])
             self.assertTrue(loaded_image.valid_mask[3, 3])
             self.assertTrue(any("connected-region mask" in warning for warning in loaded_image.image_warnings))
+
+    def test_seed_mask_supports_multiple_selected_regions(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "multi-seed-mask-source.png"
+            self._write_multi_seed_mask_source(image_path)
+
+            loaded_image = load_image_data(
+                str(image_path),
+                mask_seed_points=((0, 0), (0, 7)),
+                mask_color_tolerance=0,
+            )
+
+            self.assertEqual(loaded_image.alpha_source, "interactive-seed")
+            self.assertFalse(loaded_image.mask_prompt_required)
+            self.assertFalse(loaded_image.valid_mask[0, 0])
+            self.assertFalse(loaded_image.valid_mask[0, 7])
+            self.assertTrue(loaded_image.valid_mask[4, 4])
+
+    def test_seed_mask_region_offset_can_expand_or_shrink_selected_area(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "multi-seed-mask-source.png"
+            self._write_multi_seed_mask_source(image_path)
+
+            expanded_image = load_image_data(
+                str(image_path),
+                mask_seed_points=((0, 0),),
+                mask_color_tolerance=0,
+                mask_region_offset=1,
+            )
+            shrunk_image = load_image_data(
+                str(image_path),
+                mask_seed_points=((0, 0),),
+                mask_color_tolerance=0,
+                mask_region_offset=-1,
+            )
+
+            self.assertFalse(expanded_image.valid_mask[2, 2])
+            self.assertTrue(expanded_image.valid_mask[4, 4])
+            self.assertTrue(shrunk_image.valid_mask.all())
 
     def test_external_alpha_mask_overrides_embedded_alpha(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -168,6 +213,9 @@ class AlphaInputValidationTests(unittest.TestCase):
             dialog.exec.return_value = QtWidgets.QDialog.DialogCode.Accepted
             dialog.continue_without_mask_requested.return_value = True
             dialog.selected_mask_seed_point.return_value = None
+            dialog.selected_mask_seed_points.return_value = ()
+            dialog.selected_mask_color_tolerance.return_value = 0
+            dialog.selected_mask_region_offset.return_value = 0
             with mock.patch("texture_map_toolbox.gui.qt_editor.QtSeedMaskSelectionDialog", return_value=dialog) as dialog_cls:
                 window = launch_qt_editor(str(image_path), run_event_loop=False)
                 try:
@@ -181,14 +229,17 @@ class AlphaInputValidationTests(unittest.TestCase):
 
     def test_qt_editor_launch_can_use_seed_mask_from_prompt_dialog(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            image_path = Path(temp_dir) / "auto-mask-source.png"
-            self._write_auto_mask_source(image_path)
+            image_path = Path(temp_dir) / "multi-seed-mask-source.png"
+            self._write_multi_seed_mask_source(image_path)
 
             window = None
             dialog = mock.Mock()
             dialog.exec.return_value = QtWidgets.QDialog.DialogCode.Accepted
             dialog.continue_without_mask_requested.return_value = False
             dialog.selected_mask_seed_point.return_value = (0, 0)
+            dialog.selected_mask_seed_points.return_value = ((0, 0), (0, 7))
+            dialog.selected_mask_color_tolerance.return_value = 0
+            dialog.selected_mask_region_offset.return_value = 1
             with mock.patch("texture_map_toolbox.gui.qt_editor.QtSeedMaskSelectionDialog", return_value=dialog) as dialog_cls:
                 window = launch_qt_editor(str(image_path), run_event_loop=False)
                 try:
@@ -196,7 +247,9 @@ class AlphaInputValidationTests(unittest.TestCase):
                     self.assertIsNotNone(window)
                     self.assertEqual(window.alpha_source, "interactive-seed")
                     self.assertFalse(window.valid_mask[0, 0])
-                    self.assertTrue(window.valid_mask[3, 3])
+                    self.assertFalse(window.valid_mask[0, 7])
+                    self.assertFalse(window.valid_mask[2, 2])
+                    self.assertTrue(window.valid_mask[4, 4])
                 finally:
                     if window is not None:
                         window.close()

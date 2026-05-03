@@ -13,6 +13,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from scipy.interpolate import PchipInterpolator
 
 from texture_map_toolbox.core.luma import (
+    AUTO_MASK_COLOR_TOLERANCE,
     DEFAULT_FAST_LUT_SIZE,
     DEFAULT_FAST_PREVIEW_SCALE,
     DITHER_STRENGTH,
@@ -53,6 +54,11 @@ CURVE_BACKGROUND_HEIGHT = 256
 LIGHTNESS_HISTOGRAM_BINS = 96
 CURVE_X_DENSE = np.linspace(0.0, 1.0, CURVE_LINE_SAMPLES)
 PIL_PREVIEW_RESAMPLE = Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS
+MASK_COLOR_TOLERANCE_MAX = 64
+MASK_REGION_OFFSET_MIN = -64
+MASK_REGION_OFFSET_MAX = 64
+SEED_MARKER_FILL_COLOR = QtGui.QColor("#ff6b4a")
+SEED_MARKER_OUTLINE_COLOR = QtGui.QColor("#ffffff")
 
 
 def _evaluate_hue_curve(
@@ -119,23 +125,182 @@ def _track_top_level_window(window: QtWidgets.QWidget):
     return window
 
 
+def _coalesce_seed_points(
+    mask_seed_points: list[tuple[int, int]] | tuple[tuple[int, int], ...] | None,
+    mask_seed_point: tuple[int, int] | None = None,
+) -> tuple[tuple[int, int], ...]:
+    """Merge zero, one, or many seed points into a deduplicated tuple."""
+    resolved_points = [
+        (int(row), int(column))
+        for row, column in (mask_seed_points or ())
+    ]
+    if mask_seed_point is not None:
+        resolved_points.append((int(mask_seed_point[0]), int(mask_seed_point[1])))
+    return tuple(dict.fromkeys(resolved_points))
+
+
+def _toggle_seed_point(
+    seed_points: list[tuple[int, int]],
+    point: tuple[int, int],
+) -> list[tuple[int, int]]:
+    """Add a seed point when absent, or remove it when it is already selected."""
+    normalized_point = (int(point[0]), int(point[1]))
+    if normalized_point in seed_points:
+        return [existing_point for existing_point in seed_points if existing_point != normalized_point]
+    return [*seed_points, normalized_point]
+
+
+def _format_seed_coordinate_summary(
+    seed_points: tuple[tuple[int, int], ...] | list[tuple[int, int]],
+    *,
+    max_points: int = 4,
+) -> str:
+    """Return a compact seed summary for labels and preview metadata."""
+    normalized_points = tuple((int(row), int(column)) for row, column in seed_points)
+    if not normalized_points:
+        return "No seeds selected."
+    preview_items = [f"x={column}, y={row}" for row, column in normalized_points[:max_points]]
+    if len(normalized_points) > max_points:
+        preview_items.append(f"+{len(normalized_points) - max_points} more")
+    label = "seed" if len(normalized_points) == 1 else "seeds"
+    return f"{len(normalized_points)} {label} selected ({'; '.join(preview_items)})."
+
+
+def _format_interactive_seed_summary(
+    seed_points: tuple[tuple[int, int], ...] | list[tuple[int, int]],
+    *,
+    color_tolerance: int,
+    region_offset: int,
+) -> str:
+    """Build a compact summary for interactive seed previews."""
+    return (
+        "Left click adds or toggles seed pixels. "
+        f"{_format_seed_coordinate_summary(seed_points)} "
+        f"Color tolerance: {int(color_tolerance)}. "
+        f"Region offset: {int(region_offset):+d} px."
+    )
+
+
+class InteractiveSeedMaskControls(QtWidgets.QGroupBox):
+    """Shared controls for tuning interactive seed masks."""
+
+    values_changed = QtCore.Signal()
+    clear_requested = QtCore.Signal()
+
+    def __init__(self, title: str = "Interactive Seed Mask"):
+        super().__init__(title)
+        self._seed_points: tuple[tuple[int, int], ...] = ()
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setSpacing(8)
+
+        instructions_label = QtWidgets.QLabel(
+            "Left click on the image preview to add or toggle seed pixels. "
+            "Positive region offset expands the masked area; negative values shrink it."
+        )
+        instructions_label.setWordWrap(True)
+        layout.addWidget(instructions_label)
+
+        self.seed_summary_label = QtWidgets.QLabel("No seeds selected.")
+        self.seed_summary_label.setWordWrap(True)
+        self.seed_summary_label.setStyleSheet("color: #cccccc;")
+        layout.addWidget(self.seed_summary_label)
+
+        self.color_tolerance_slider, self.color_tolerance_value_label = self._build_slider_row(
+            layout,
+            label_text="Color Tolerance",
+            minimum=0,
+            maximum=MASK_COLOR_TOLERANCE_MAX,
+            value=AUTO_MASK_COLOR_TOLERANCE,
+            formatter=lambda value: str(int(value)),
+        )
+        self.region_offset_slider, self.region_offset_value_label = self._build_slider_row(
+            layout,
+            label_text="Region Offset",
+            minimum=MASK_REGION_OFFSET_MIN,
+            maximum=MASK_REGION_OFFSET_MAX,
+            value=0,
+            formatter=lambda value: f"{int(value):+d} px",
+        )
+
+        button_row = QtWidgets.QHBoxLayout()
+        button_row.addStretch(1)
+        self.clear_seeds_button = QtWidgets.QPushButton("Clear Seeds")
+        self.clear_seeds_button.clicked.connect(self.clear_requested)
+        button_row.addWidget(self.clear_seeds_button)
+        layout.addLayout(button_row)
+
+        self.color_tolerance_slider.valueChanged.connect(self.values_changed)
+        self.region_offset_slider.valueChanged.connect(self.values_changed)
+        self.set_seed_points(())
+
+    def _build_slider_row(
+        self,
+        layout: QtWidgets.QVBoxLayout,
+        *,
+        label_text: str,
+        minimum: int,
+        maximum: int,
+        value: int,
+        formatter,
+    ) -> tuple[QtWidgets.QSlider, QtWidgets.QLabel]:
+        row_layout = QtWidgets.QGridLayout()
+        row_layout.setHorizontalSpacing(8)
+        row_layout.setVerticalSpacing(4)
+
+        label = QtWidgets.QLabel(label_text)
+        slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        slider.setRange(int(minimum), int(maximum))
+        slider.setValue(int(value))
+        value_label = QtWidgets.QLabel()
+        value_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+        value_label.setMinimumWidth(64)
+
+        def _update_value_label(slider_value: int):
+            value_label.setText(formatter(slider_value))
+
+        slider.valueChanged.connect(_update_value_label)
+        _update_value_label(slider.value())
+
+        row_layout.addWidget(label, 0, 0)
+        row_layout.addWidget(slider, 0, 1)
+        row_layout.addWidget(value_label, 0, 2)
+        layout.addLayout(row_layout)
+        return slider, value_label
+
+    def color_tolerance(self) -> int:
+        return int(self.color_tolerance_slider.value())
+
+    def region_offset(self) -> int:
+        return int(self.region_offset_slider.value())
+
+    def set_seed_points(self, seed_points: tuple[tuple[int, int], ...] | list[tuple[int, int]]):
+        self._seed_points = tuple((int(row), int(column)) for row, column in seed_points)
+        self.seed_summary_label.setText(_format_seed_coordinate_summary(self._seed_points))
+        self.clear_seeds_button.setEnabled(bool(self._seed_points))
+
+
 def _resolve_qt_mask_loading(
     parent: QtWidgets.QWidget | None,
     image_path: str,
     alpha_mask_path: str | None,
+    mask_seed_points: list[tuple[int, int]] | tuple[tuple[int, int], ...] | None,
     mask_seed_point: tuple[int, int] | None,
     *,
+    mask_color_tolerance: int,
+    mask_region_offset: int,
     prompt_user: bool,
-) -> tuple[str | None, tuple[int, int] | None, bool, bool]:
+) -> tuple[str | None, tuple[tuple[int, int], ...] | None, int, int, bool, bool]:
     """Resolve whether the editor should use an external mask, a clicked seed mask, or continue opaque."""
+    resolved_seed_points = _coalesce_seed_points(mask_seed_points, mask_seed_point)
     if alpha_mask_path is not None:
-        return alpha_mask_path, None, False, False
-    if mask_seed_point is not None:
-        return None, mask_seed_point, False, False
+        return alpha_mask_path, None, int(mask_color_tolerance), int(mask_region_offset), False, False
+    if resolved_seed_points:
+        return None, resolved_seed_points, int(mask_color_tolerance), int(mask_region_offset), False, False
 
     loaded_image = load_image_data(image_path)
     if not loaded_image.mask_prompt_required or not prompt_user:
-        return None, None, False, False
+        return None, None, int(mask_color_tolerance), int(mask_region_offset), False, False
 
     dialog = QtSeedMaskSelectionDialog(
         parent,
@@ -145,9 +310,16 @@ def _resolve_qt_mask_loading(
     result = dialog.exec()
     if result == QtWidgets.QDialog.DialogCode.Accepted:
         if dialog.continue_without_mask_requested():
-            return None, None, True, False
-        return None, dialog.selected_mask_seed_point(), True, False
-    return None, None, True, True
+            return None, None, dialog.selected_mask_color_tolerance(), dialog.selected_mask_region_offset(), True, False
+        return (
+            None,
+            dialog.selected_mask_seed_points(),
+            dialog.selected_mask_color_tolerance(),
+            dialog.selected_mask_region_offset(),
+            True,
+            False,
+        )
+    return None, None, int(mask_color_tolerance), int(mask_region_offset), True, True
 
 
 class QtTargetImagePickerDialog(QtWidgets.QDialog):
@@ -164,7 +336,7 @@ class QtTargetImagePickerDialog(QtWidgets.QDialog):
         super().__init__(parent)
         self.setWindowTitle("Load L/C/H Target")
         self.resize(1120, 760)
-        self._mask_seed_point: tuple[int, int] | None = None
+        self._mask_seed_points: list[tuple[int, int]] = []
 
         root_layout = QtWidgets.QVBoxLayout(self)
         root_layout.setContentsMargins(18, 18, 18, 18)
@@ -214,6 +386,9 @@ class QtTargetImagePickerDialog(QtWidgets.QDialog):
         mask_layout.addWidget(self.mask_browse_button)
         mask_layout.addWidget(self.mask_clear_button)
         controls_layout.addLayout(mask_layout)
+
+        self.seed_mask_controls = InteractiveSeedMaskControls()
+        controls_layout.addWidget(self.seed_mask_controls)
 
         checkbox_layout = QtWidgets.QHBoxLayout()
         self.lightness_checkbox = QtWidgets.QCheckBox("Apply to L")
@@ -268,6 +443,8 @@ class QtTargetImagePickerDialog(QtWidgets.QDialog):
         self.load_mask_radio.toggled.connect(self._on_mask_mode_changed)
         self.pick_region_radio.toggled.connect(self._on_mask_mode_changed)
         self.image_preview_label.image_point_clicked.connect(self._handle_image_preview_click)
+        self.seed_mask_controls.values_changed.connect(self._refresh_previews)
+        self.seed_mask_controls.clear_requested.connect(self._clear_seed_points)
 
         self._set_initial_mask_mode(initial_mask_mode)
         self._sync_mask_controls()
@@ -294,10 +471,13 @@ class QtTargetImagePickerDialog(QtWidgets.QDialog):
         self.mask_path_edit.setEnabled(mask_controls_enabled)
         self.mask_browse_button.setEnabled(mask_controls_enabled)
         self.mask_clear_button.setEnabled(mask_controls_enabled)
-        self.image_preview_label.set_click_enabled(self._mask_mode() == "interactive-seed")
+        interactive_seed_enabled = self._mask_mode() == "interactive-seed"
+        self.image_preview_label.set_click_enabled(interactive_seed_enabled)
+        self.seed_mask_controls.setEnabled(interactive_seed_enabled)
+        self.seed_mask_controls.set_seed_points(self._mask_seed_points)
 
     def _on_image_path_changed(self):
-        self._mask_seed_point = None
+        self._mask_seed_points = []
         self._refresh_previews()
 
     def _on_mask_mode_changed(self):
@@ -307,7 +487,11 @@ class QtTargetImagePickerDialog(QtWidgets.QDialog):
     def _handle_image_preview_click(self, row: int, column: int):
         if self._mask_mode() != "interactive-seed":
             return
-        self._mask_seed_point = (int(row), int(column))
+        self._mask_seed_points = _toggle_seed_point(self._mask_seed_points, (row, column))
+        self._refresh_previews()
+
+    def _clear_seed_points(self):
+        self._mask_seed_points = []
         self._refresh_previews()
 
     def _clear_mask(self):
@@ -342,12 +526,11 @@ class QtTargetImagePickerDialog(QtWidgets.QDialog):
             )
             return
         if self._mask_mode() == "interactive-seed":
-            summary = "Click one pixel to remove its connected region from the mask preview."
-            if self._mask_seed_point is not None:
-                summary = (
-                    "Click one pixel to remove its connected region from the mask preview. "
-                    f"Selected seed: x={self._mask_seed_point[1]}, y={self._mask_seed_point[0]}."
-                )
+            summary = _format_interactive_seed_summary(
+                self._mask_seed_points,
+                color_tolerance=self.seed_mask_controls.color_tolerance(),
+                region_offset=self.seed_mask_controls.region_offset(),
+            )
         else:
             summary = "Previewing the selected target image."
         _set_preview_panel_state(
@@ -357,6 +540,7 @@ class QtTargetImagePickerDialog(QtWidgets.QDialog):
             placeholder_text="Target Image Preview",
             info_text=_format_image_preview_info(image_shape, summary=summary),
             source_image_shape=image_shape,
+            marker_points=self._mask_seed_points if self._mask_mode() == "interactive-seed" else (),
         )
 
     def _refresh_mask_preview(self):
@@ -399,22 +583,24 @@ class QtTargetImagePickerDialog(QtWidgets.QDialog):
                     self.mask_preview_info_label,
                     preview_rgb=None,
                     placeholder_text="Mask Preview",
-                    info_text="Choose a target image, then click one pixel in the image preview.",
+                    info_text="Choose a target image, then click one or more pixels in the image preview.",
                 )
                 return
-            if self._mask_seed_point is None:
+            if not self._mask_seed_points:
                 _set_preview_panel_state(
                     self.mask_preview_label,
                     self.mask_preview_info_label,
                     preview_rgb=None,
                     placeholder_text="Mask Preview",
-                    info_text="Click one pixel in the target image preview to build a connected-region mask.",
+                    info_text="Click one or more pixels in the target image preview to build a connected-region mask.",
                 )
                 return
             try:
                 preview_rgb, mask_shape, valid_pixels, summary = _load_seeded_mask_preview_uint8(
                     image_path,
-                    self._mask_seed_point,
+                    self._mask_seed_points,
+                    color_tolerance=self.seed_mask_controls.color_tolerance(),
+                    region_offset=self.seed_mask_controls.region_offset(),
                 )
                 info_text, info_style = _format_mask_preview_info(
                     mask_shape,
@@ -504,7 +690,18 @@ class QtTargetImagePickerDialog(QtWidgets.QDialog):
     def selected_mask_seed_point(self) -> tuple[int, int] | None:
         if self._mask_mode() != "interactive-seed":
             return None
-        return self._mask_seed_point
+        return self._mask_seed_points[-1] if self._mask_seed_points else None
+
+    def selected_mask_seed_points(self) -> tuple[tuple[int, int], ...] | None:
+        if self._mask_mode() != "interactive-seed":
+            return None
+        return tuple(self._mask_seed_points)
+
+    def selected_mask_color_tolerance(self) -> int:
+        return self.seed_mask_controls.color_tolerance()
+
+    def selected_mask_region_offset(self) -> int:
+        return self.seed_mask_controls.region_offset()
 
     def selected_curve_flags(self) -> tuple[bool, bool, bool]:
         return (
@@ -523,11 +720,11 @@ class QtTargetImagePickerDialog(QtWidgets.QDialog):
         if self.load_mask_radio.isChecked() and mask_path is None:
             QtWidgets.QMessageBox.critical(self, "Target Mask Required", "Please choose a target mask first.")
             return
-        if self._mask_mode() == "interactive-seed" and self._mask_seed_point is None:
+        if self._mask_mode() == "interactive-seed" and not self._mask_seed_points:
             QtWidgets.QMessageBox.critical(
                 self,
                 "Seed Pixel Required",
-                "Please click one pixel in the target image preview first.",
+                "Please click one or more pixels in the target image preview first.",
             )
             return
         if mask_path is not None:
@@ -557,6 +754,7 @@ class ImagePreviewLabel(QtWidgets.QLabel):
         self._pixmap: QtGui.QPixmap | None = None
         self._preview_shape: tuple[int, int] | None = None
         self._source_shape: tuple[int, int] | None = None
+        self._marker_points: tuple[tuple[int, int], ...] = ()
         self._click_enabled = False
         self.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         self.setMinimumSize(320, 320)
@@ -576,9 +774,15 @@ class ImagePreviewLabel(QtWidgets.QLabel):
         self._pixmap = None
         self._preview_shape = None
         self._source_shape = None
+        self._marker_points = ()
         self.clear()
         self.setText(text or self._title)
         self._refresh_cursor()
+
+    def set_marker_points(self, marker_points: tuple[tuple[int, int], ...] | list[tuple[int, int]]):
+        """Overlay source-image marker points on top of the preview."""
+        self._marker_points = tuple((int(row), int(column)) for row, column in marker_points)
+        self._refresh_pixmap()
 
     def set_click_enabled(self, enabled: bool):
         """Enable or disable image-coordinate click reporting."""
@@ -606,6 +810,21 @@ class ImagePreviewLabel(QtWidgets.QLabel):
             QtCore.Qt.AspectRatioMode.KeepAspectRatio,
             QtCore.Qt.TransformationMode.SmoothTransformation,
         )
+        if self._marker_points and self._source_shape is not None:
+            scaled = scaled.copy()
+            source_height, source_width = self._source_shape
+            painter = QtGui.QPainter(scaled)
+            painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+            marker_radius = max(4.0, min(float(scaled.width()), float(scaled.height())) / 45.0)
+            pen = QtGui.QPen(SEED_MARKER_OUTLINE_COLOR)
+            pen.setWidthF(max(1.5, marker_radius / 3.0))
+            painter.setPen(pen)
+            painter.setBrush(SEED_MARKER_FILL_COLOR)
+            for row, column in self._marker_points:
+                x_value = (float(column) + 0.5) * float(scaled.width()) / max(1.0, float(source_width))
+                y_value = (float(row) + 0.5) * float(scaled.height()) / max(1.0, float(source_height))
+                painter.drawEllipse(QtCore.QPointF(x_value, y_value), marker_radius, marker_radius)
+            painter.end()
         self.setPixmap(scaled)
 
     def _refresh_cursor(self):
@@ -694,18 +913,33 @@ def _load_embedded_or_implicit_mask_preview_uint8(
 
 def _load_seeded_mask_preview_uint8(
     image_path: str,
-    seed_point: tuple[int, int],
+    seed_points: tuple[tuple[int, int], ...] | list[tuple[int, int]],
+    *,
+    color_tolerance: int,
+    region_offset: int,
 ) -> tuple[np.ndarray, tuple[int, int], int, str]:
-    """Generate a preview for a connected-region mask grown from a user-selected seed pixel."""
+    """Generate a preview for a connected-region mask grown from one or more user-selected seed pixels."""
     with Image.open(image_path) as image:
         rgb_float = np.asarray(image.convert("RGB"), dtype=np.float64) / 255.0
-    valid_mask = detect_seeded_valid_mask(rgb_float, seed_point)
+    resolved_seed_points = tuple((int(row), int(column)) for row, column in seed_points)
+    valid_mask = detect_seeded_valid_mask(
+        rgb_float,
+        resolved_seed_points,
+        color_tolerance=int(color_tolerance),
+        region_offset_pixels=int(region_offset),
+    )
     preview_rgb, mask_shape, valid_pixels = _mask_to_preview_uint8(valid_mask)
+    seed_label = "seed pixel" if len(resolved_seed_points) == 1 else "seed pixels"
     return (
         preview_rgb,
         mask_shape,
         valid_pixels,
-        "Previewing the connected-region mask from the selected seed pixel.",
+        "Previewing the connected-region mask from {} {}. Color tolerance: {}. Region offset: {:+d} px.".format(
+            len(resolved_seed_points),
+            seed_label,
+            int(color_tolerance),
+            int(region_offset),
+        ),
     )
 
 
@@ -718,12 +952,14 @@ def _set_preview_panel_state(
     info_text: str,
     info_style: str = "color: #cccccc;",
     source_image_shape: tuple[int, int] | None = None,
+    marker_points: tuple[tuple[int, int], ...] | list[tuple[int, int]] = (),
 ):
     """Update a preview label plus its companion info label."""
     if preview_rgb is None:
         preview_label.clear_preview(placeholder_text)
     else:
         preview_label.set_rgb_uint8(preview_rgb, source_image_shape=source_image_shape)
+        preview_label.set_marker_points(marker_points)
     info_label.setText(info_text)
     info_label.setStyleSheet(info_style)
 
@@ -860,7 +1096,7 @@ def _select_mask_path_with_preview(
 
 
 class QtSeedMaskSelectionDialog(QtWidgets.QDialog):
-    """Modal dialog that lets the user click one seed pixel and preview its connected-region mask."""
+    """Modal dialog that lets the user click seed pixels and preview the connected-region mask."""
 
     def __init__(
         self,
@@ -873,7 +1109,7 @@ class QtSeedMaskSelectionDialog(QtWidgets.QDialog):
         self.setWindowTitle("Select Mask Seed")
         self.resize(980, 720)
         self._image_path = image_path
-        self._mask_seed_point: tuple[int, int] | None = None
+        self._mask_seed_points: list[tuple[int, int]] = []
         self._continue_without_mask = False
 
         root_layout = QtWidgets.QVBoxLayout(self)
@@ -881,11 +1117,16 @@ class QtSeedMaskSelectionDialog(QtWidgets.QDialog):
         root_layout.setSpacing(12)
 
         instructions = list(image_warnings)
-        instructions.append("Click one pixel in the image preview. The connected region grown from that pixel will be masked out.")
+        instructions.append(
+            "Click one or more pixels in the image preview. Each connected region grown from those pixels will be masked out."
+        )
         instructions.append("Use 'Continue Without Extra Mask' if you want to keep the whole image valid.")
         description_label = QtWidgets.QLabel("\n\n".join(instructions))
         description_label.setWordWrap(True)
         root_layout.addWidget(description_label)
+
+        self.seed_mask_controls = InteractiveSeedMaskControls()
+        root_layout.addWidget(self.seed_mask_controls)
 
         previews_layout = QtWidgets.QHBoxLayout()
         previews_layout.setSpacing(12)
@@ -928,11 +1169,22 @@ class QtSeedMaskSelectionDialog(QtWidgets.QDialog):
         self.continue_button.clicked.connect(self._continue_without_mask_clicked)
         self.cancel_button.clicked.connect(self.reject)
         self.image_preview_label.image_point_clicked.connect(self._handle_image_preview_click)
+        self.seed_mask_controls.values_changed.connect(self._refresh_previews)
+        self.seed_mask_controls.clear_requested.connect(self._clear_seed_points)
 
         self._refresh_previews()
 
     def selected_mask_seed_point(self) -> tuple[int, int] | None:
-        return self._mask_seed_point
+        return self._mask_seed_points[-1] if self._mask_seed_points else None
+
+    def selected_mask_seed_points(self) -> tuple[tuple[int, int], ...]:
+        return tuple(self._mask_seed_points)
+
+    def selected_mask_color_tolerance(self) -> int:
+        return self.seed_mask_controls.color_tolerance()
+
+    def selected_mask_region_offset(self) -> int:
+        return self.seed_mask_controls.region_offset()
 
     def continue_without_mask_requested(self) -> bool:
         return self._continue_without_mask
@@ -941,8 +1193,12 @@ class QtSeedMaskSelectionDialog(QtWidgets.QDialog):
         if self._continue_without_mask:
             super().accept()
             return
-        if self._mask_seed_point is None:
-            QtWidgets.QMessageBox.critical(self, "Seed Pixel Required", "Please click one pixel in the image preview first.")
+        if not self._mask_seed_points:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Seed Pixel Required",
+                "Please click one or more pixels in the image preview first.",
+            )
             return
         super().accept()
 
@@ -952,7 +1208,12 @@ class QtSeedMaskSelectionDialog(QtWidgets.QDialog):
 
     def _handle_image_preview_click(self, row: int, column: int):
         self._continue_without_mask = False
-        self._mask_seed_point = (int(row), int(column))
+        self._mask_seed_points = _toggle_seed_point(self._mask_seed_points, (row, column))
+        self._refresh_previews()
+
+    def _clear_seed_points(self):
+        self._continue_without_mask = False
+        self._mask_seed_points = []
         self._refresh_previews()
 
     def _refresh_previews(self):
@@ -973,11 +1234,11 @@ class QtSeedMaskSelectionDialog(QtWidgets.QDialog):
             )
             return
         summary = "Click one pixel to remove its connected region from the mask."
-        if self._mask_seed_point is not None:
-            summary = (
-                "Click one pixel to remove its connected region from the mask. "
-                f"Selected seed: x={self._mask_seed_point[1]}, y={self._mask_seed_point[0]}."
-            )
+        summary = _format_interactive_seed_summary(
+            self._mask_seed_points,
+            color_tolerance=self.seed_mask_controls.color_tolerance(),
+            region_offset=self.seed_mask_controls.region_offset(),
+        )
         _set_preview_panel_state(
             self.image_preview_label,
             self.image_preview_info_label,
@@ -985,23 +1246,27 @@ class QtSeedMaskSelectionDialog(QtWidgets.QDialog):
             placeholder_text="Input Image Preview",
             info_text=_format_image_preview_info(image_shape, summary=summary),
             source_image_shape=image_shape,
+            marker_points=self._mask_seed_points,
         )
+        self.seed_mask_controls.set_seed_points(self._mask_seed_points)
 
     def _refresh_mask_preview(self):
         expected_shape = _load_optional_image_shape(self._image_path)
-        if self._mask_seed_point is None:
+        if not self._mask_seed_points:
             _set_preview_panel_state(
                 self.mask_preview_label,
                 self.mask_preview_info_label,
                 preview_rgb=None,
                 placeholder_text="Mask Preview",
-                info_text="Click one pixel in the image preview to build a connected-region mask.",
+                info_text="Click one or more pixels in the image preview to build a connected-region mask.",
             )
             return
         try:
             preview_rgb, mask_shape, valid_pixels, summary = _load_seeded_mask_preview_uint8(
                 self._image_path,
-                self._mask_seed_point,
+                self._mask_seed_points,
+                color_tolerance=self.seed_mask_controls.color_tolerance(),
+                region_offset=self.seed_mask_controls.region_offset(),
             )
             info_text, info_style = _format_mask_preview_info(
                 mask_shape,
@@ -1454,14 +1719,20 @@ class QtOklchCurveEditorWindow(QtWidgets.QMainWindow):
         image_path: str,
         *,
         alpha_mask_path: str | None = None,
+        mask_seed_points: list[tuple[int, int]] | tuple[tuple[int, int], ...] | None = None,
         mask_seed_point: tuple[int, int] | None = None,
+        mask_color_tolerance: int = AUTO_MASK_COLOR_TOLERANCE,
+        mask_region_offset: int = 0,
         show_warnings: bool = True,
     ) -> tuple[LoadedImageData, OklchCurveModel, np.ndarray]:
         """Load a target image and build its Oklch curve model."""
         loaded_image = load_image_data(
             image_path,
             alpha_mask_path=alpha_mask_path,
+            mask_seed_points=mask_seed_points,
             mask_seed_point=mask_seed_point,
+            mask_color_tolerance=mask_color_tolerance,
+            mask_region_offset=mask_region_offset,
         )
         if show_warnings:
             self._show_image_warnings("Target Image Warning", loaded_image.image_warnings)
@@ -1485,7 +1756,10 @@ class QtOklchCurveEditorWindow(QtWidgets.QMainWindow):
         image_path: str,
         *,
         alpha_mask_path: str | None = None,
+        mask_seed_points: list[tuple[int, int]] | tuple[tuple[int, int], ...] | None = None,
         mask_seed_point: tuple[int, int] | None = None,
+        mask_color_tolerance: int = AUTO_MASK_COLOR_TOLERANCE,
+        mask_region_offset: int = 0,
         apply_lightness: bool,
         apply_chroma: bool,
         apply_hue: bool,
@@ -1498,7 +1772,10 @@ class QtOklchCurveEditorWindow(QtWidgets.QMainWindow):
         loaded_image, target_model, target_lightness_samples = self._load_target_curve_model(
             image_path,
             alpha_mask_path=alpha_mask_path,
+            mask_seed_points=mask_seed_points,
             mask_seed_point=mask_seed_point,
+            mask_color_tolerance=mask_color_tolerance,
+            mask_region_offset=mask_region_offset,
             show_warnings=show_warnings,
         )
         self._last_target_image_dialog_path = loaded_image.image_path
@@ -1594,7 +1871,7 @@ class QtOklchCurveEditorWindow(QtWidgets.QMainWindow):
 
         selected_path = dialog.selected_image_path()
         selected_mask_path = dialog.selected_mask_path()
-        mask_seed_point = dialog.selected_mask_seed_point()
+        mask_seed_points = dialog.selected_mask_seed_points()
         apply_lightness, apply_chroma, apply_hue = dialog.selected_curve_flags()
         if selected_path is None:
             return
@@ -1602,7 +1879,9 @@ class QtOklchCurveEditorWindow(QtWidgets.QMainWindow):
             self.apply_target_image_selection(
                 selected_path,
                 alpha_mask_path=selected_mask_path,
-                mask_seed_point=mask_seed_point,
+                mask_seed_points=mask_seed_points,
+                mask_color_tolerance=dialog.selected_mask_color_tolerance(),
+                mask_region_offset=dialog.selected_mask_region_offset(),
                 apply_lightness=apply_lightness,
                 apply_chroma=apply_chroma,
                 apply_hue=apply_hue,
@@ -1756,7 +2035,7 @@ class QtEditorLauncherWindow(QtWidgets.QWidget):
         super().__init__()
         self.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.dither_strength = float(dither_strength)
-        self._mask_seed_point: tuple[int, int] | None = None
+        self._mask_seed_points: list[tuple[int, int]] = []
         self._opened_editors: list[QtOklchCurveEditorWindow] = []
         self._build_ui()
         self.image_path_edit.setText(image_path or "")
@@ -1849,6 +2128,9 @@ class QtEditorLauncherWindow(QtWidgets.QWidget):
             secondary_handler=self._clear_alpha_mask,
         )
 
+        self.seed_mask_controls = InteractiveSeedMaskControls()
+        controls_layout.addWidget(self.seed_mask_controls)
+
         file_form_layout = QtWidgets.QGridLayout()
         file_form_layout.setHorizontalSpacing(10)
         file_form_layout.setVerticalSpacing(10)
@@ -1920,6 +2202,8 @@ class QtEditorLauncherWindow(QtWidgets.QWidget):
         self.load_mask_radio.toggled.connect(self._on_mask_mode_changed)
         self.pick_region_radio.toggled.connect(self._on_mask_mode_changed)
         self.input_image_preview_label.image_point_clicked.connect(self._handle_image_preview_click)
+        self.seed_mask_controls.values_changed.connect(self._refresh_previews)
+        self.seed_mask_controls.clear_requested.connect(self._clear_seed_points)
 
     def _add_path_row(
         self,
@@ -1964,10 +2248,13 @@ class QtEditorLauncherWindow(QtWidgets.QWidget):
         self.alpha_mask_path_edit.setEnabled(controls_enabled)
         self.alpha_mask_browse_button.setEnabled(controls_enabled)
         self.alpha_mask_clear_button.setEnabled(controls_enabled)
-        self.input_image_preview_label.set_click_enabled(self._mask_mode() == "interactive-seed")
+        interactive_seed_enabled = self._mask_mode() == "interactive-seed"
+        self.input_image_preview_label.set_click_enabled(interactive_seed_enabled)
+        self.seed_mask_controls.setEnabled(interactive_seed_enabled)
+        self.seed_mask_controls.set_seed_points(self._mask_seed_points)
 
     def _on_image_path_changed(self):
-        self._mask_seed_point = None
+        self._mask_seed_points = []
         self._refresh_previews()
 
     def _on_mask_mode_changed(self):
@@ -1977,7 +2264,11 @@ class QtEditorLauncherWindow(QtWidgets.QWidget):
     def _handle_image_preview_click(self, row: int, column: int):
         if self._mask_mode() != "interactive-seed":
             return
-        self._mask_seed_point = (int(row), int(column))
+        self._mask_seed_points = _toggle_seed_point(self._mask_seed_points, (row, column))
+        self._refresh_previews()
+
+    def _clear_seed_points(self):
+        self._mask_seed_points = []
         self._refresh_previews()
 
     def _clear_alpha_mask(self):
@@ -2012,12 +2303,11 @@ class QtEditorLauncherWindow(QtWidgets.QWidget):
             )
             return
         if self._mask_mode() == "interactive-seed":
-            summary = "Click one pixel to remove its connected region from the mask preview."
-            if self._mask_seed_point is not None:
-                summary = (
-                    "Click one pixel to remove its connected region from the mask preview. "
-                    f"Selected seed: x={self._mask_seed_point[1]}, y={self._mask_seed_point[0]}."
-                )
+            summary = _format_interactive_seed_summary(
+                self._mask_seed_points,
+                color_tolerance=self.seed_mask_controls.color_tolerance(),
+                region_offset=self.seed_mask_controls.region_offset(),
+            )
         else:
             summary = "Previewing the selected input image."
         _set_preview_panel_state(
@@ -2027,6 +2317,7 @@ class QtEditorLauncherWindow(QtWidgets.QWidget):
             placeholder_text="Input Image Preview",
             info_text=_format_image_preview_info(image_shape, summary=summary),
             source_image_shape=image_shape,
+            marker_points=self._mask_seed_points if self._mask_mode() == "interactive-seed" else (),
         )
 
     def _refresh_mask_preview(self):
@@ -2069,22 +2360,24 @@ class QtEditorLauncherWindow(QtWidgets.QWidget):
                     self.mask_preview_info_label,
                     preview_rgb=None,
                     placeholder_text="Mask Preview",
-                    info_text="Choose an input image, then click one pixel in the image preview.",
+                    info_text="Choose an input image, then click one or more pixels in the image preview.",
                 )
                 return
-            if self._mask_seed_point is None:
+            if not self._mask_seed_points:
                 _set_preview_panel_state(
                     self.mask_preview_label,
                     self.mask_preview_info_label,
                     preview_rgb=None,
                     placeholder_text="Mask Preview",
-                    info_text="Click one pixel in the input image preview to build a connected-region mask.",
+                    info_text="Click one or more pixels in the input image preview to build a connected-region mask.",
                 )
                 return
             try:
                 preview_rgb, mask_shape, valid_pixels, summary = _load_seeded_mask_preview_uint8(
                     image_path,
-                    self._mask_seed_point,
+                    self._mask_seed_points,
+                    color_tolerance=self.seed_mask_controls.color_tolerance(),
+                    region_offset=self.seed_mask_controls.region_offset(),
                 )
                 info_text, info_style = _format_mask_preview_info(
                     mask_shape,
@@ -2204,7 +2497,7 @@ class QtEditorLauncherWindow(QtWidgets.QWidget):
 
         mask_mode = self._mask_mode()
         alpha_mask_path = None
-        mask_seed_point = None
+        mask_seed_points = None
         if mask_mode == "external":
             alpha_mask_path = self._line_edit_text_or_none(self.alpha_mask_path_edit)
             if alpha_mask_path is None:
@@ -2216,16 +2509,18 @@ class QtEditorLauncherWindow(QtWidgets.QWidget):
                 self._show_error("Alpha Mask Size Mismatch", "Alpha mask size must match the selected input image.")
                 return None
         elif mask_mode == "interactive-seed":
-            if self._mask_seed_point is None:
-                self._show_error("Seed Pixel Required", "Please click one pixel in the input image preview first.")
+            if not self._mask_seed_points:
+                self._show_error("Seed Pixel Required", "Please click one or more pixels in the input image preview first.")
                 return None
-            mask_seed_point = self._mask_seed_point
+            mask_seed_points = tuple(self._mask_seed_points)
 
         try:
             editor_window = build_qt_editor(
                 image_path,
                 alpha_mask_path=alpha_mask_path,
-                mask_seed_point=mask_seed_point,
+                mask_seed_points=mask_seed_points,
+                mask_color_tolerance=self.seed_mask_controls.color_tolerance(),
+                mask_region_offset=self.seed_mask_controls.region_offset(),
                 curve_path=self._line_edit_text_or_none(self.curve_path_edit),
                 curve_output_path=self._line_edit_text_or_none(self.curve_output_path_edit),
                 dither_strength=self.dither_strength,
@@ -2254,7 +2549,10 @@ def build_qt_editor(
     image_path: str | None,
     *,
     alpha_mask_path: str | None = None,
+    mask_seed_points: list[tuple[int, int]] | tuple[tuple[int, int], ...] | None = None,
     mask_seed_point: tuple[int, int] | None = None,
+    mask_color_tolerance: int = AUTO_MASK_COLOR_TOLERANCE,
+    mask_region_offset: int = 0,
     curve_path: str | None = None,
     curve_output_path: str | None = None,
     dither_strength: float = DITHER_STRENGTH,
@@ -2265,7 +2563,10 @@ def build_qt_editor(
     loaded_image = load_image_data(
         resolved_image_path,
         alpha_mask_path=alpha_mask_path,
+        mask_seed_points=mask_seed_points,
         mask_seed_point=mask_seed_point,
+        mask_color_tolerance=mask_color_tolerance,
+        mask_region_offset=mask_region_offset,
     )
     rgb_float = loaded_image.rgb_float
     oklch_float = loaded_image.oklch_float
@@ -2315,7 +2616,10 @@ def launch_qt_editor(
     image_path: str | None,
     *,
     alpha_mask_path: str | None = None,
+    mask_seed_points: list[tuple[int, int]] | tuple[tuple[int, int], ...] | None = None,
     mask_seed_point: tuple[int, int] | None = None,
+    mask_color_tolerance: int = AUTO_MASK_COLOR_TOLERANCE,
+    mask_region_offset: int = 0,
     curve_path: str | None = None,
     curve_output_path: str | None = None,
     dither_strength: float = DITHER_STRENGTH,
@@ -2324,11 +2628,21 @@ def launch_qt_editor(
 ) -> QtOklchCurveEditorWindow | None:
     """Launch the Qt MVP editor and optionally enter the Qt event loop."""
     app, owns_app = _ensure_qt_application()
-    resolved_alpha_mask_path, resolved_mask_seed_point, prompt_was_shown, cancelled = _resolve_qt_mask_loading(
+    (
+        resolved_alpha_mask_path,
+        resolved_mask_seed_points,
+        resolved_mask_color_tolerance,
+        resolved_mask_region_offset,
+        prompt_was_shown,
+        cancelled,
+    ) = _resolve_qt_mask_loading(
         None,
         resolve_input_image_path(image_path),
         alpha_mask_path,
+        mask_seed_points,
         mask_seed_point,
+        mask_color_tolerance=mask_color_tolerance,
+        mask_region_offset=mask_region_offset,
         prompt_user=show_warning_dialogs,
     )
     if cancelled:
@@ -2336,7 +2650,9 @@ def launch_qt_editor(
     window = build_qt_editor(
         image_path,
         alpha_mask_path=resolved_alpha_mask_path,
-        mask_seed_point=resolved_mask_seed_point,
+        mask_seed_points=resolved_mask_seed_points,
+        mask_color_tolerance=resolved_mask_color_tolerance,
+        mask_region_offset=resolved_mask_region_offset,
         curve_path=curve_path,
         curve_output_path=curve_output_path,
         dither_strength=dither_strength,

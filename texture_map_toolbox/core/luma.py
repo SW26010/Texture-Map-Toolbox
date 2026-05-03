@@ -6,7 +6,7 @@ from pathlib import Path
 
 import colour
 import numpy as np
-from scipy.ndimage import binary_propagation
+from scipy.ndimage import binary_dilation, binary_erosion, binary_propagation
 from scipy.interpolate import PchipInterpolator
 from skimage import io
 from skimage.metrics import peak_signal_noise_ratio
@@ -421,34 +421,88 @@ def _candidate_has_edge_run(candidate_mask: np.ndarray, border_width: int, min_e
     return any(_longest_true_run(line) >= int(min_edge_run) for line in edge_lines)
 
 
+def _normalize_seed_points(
+    seed_point: tuple[int, int] | list[tuple[int, int]] | tuple[tuple[int, int], ...] | None,
+    *,
+    argument_name: str,
+) -> tuple[tuple[int, int], ...]:
+    """Normalize one seed point or a collection of seed points into a deduplicated tuple."""
+    if seed_point is None:
+        return ()
+
+    candidate_points = seed_point.tolist() if isinstance(seed_point, np.ndarray) else seed_point
+    if not isinstance(candidate_points, (list, tuple)):
+        raise ValueError(f"{argument_name} must be one (row, column) pair or a collection of such pairs")
+    if len(candidate_points) == 0:
+        return ()
+
+    first_value = candidate_points[0]
+    if isinstance(first_value, (int, np.integer)):
+        if len(candidate_points) != 2:
+            raise ValueError(f"{argument_name} must be a (row, column) pair")
+        return ((int(candidate_points[0]), int(candidate_points[1])),)
+
+    normalized_points: list[tuple[int, int]] = []
+    for value in candidate_points:
+        if not isinstance(value, (list, tuple)) or len(value) != 2:
+            raise ValueError(f"{argument_name} must contain only (row, column) pairs")
+        normalized_points.append((int(value[0]), int(value[1])))
+    return tuple(dict.fromkeys(normalized_points))
+
+
 def detect_seeded_valid_mask(
     rgb_float: np.ndarray,
-    seed_point: tuple[int, int],
+    seed_point: tuple[int, int] | list[tuple[int, int]] | tuple[tuple[int, int], ...],
     *,
     color_tolerance: int = AUTO_MASK_COLOR_TOLERANCE,
+    region_offset_pixels: int = 0,
 ) -> np.ndarray:
-    """Return a valid-pixel mask by flood-filling from a user-selected seed pixel."""
+    """Return a valid-pixel mask by flood-filling from one or more user-selected seed pixels."""
+    seed_points = _normalize_seed_points(seed_point, argument_name="seed point")
+    if not seed_points:
+        raise ValueError("seeded mask detection requires at least one seed point")
+
     rgb_uint8 = img_as_ubyte(np.clip(np.asarray(rgb_float, dtype=np.float64), 0.0, 1.0))
     if rgb_uint8.ndim != 3 or rgb_uint8.shape[2] < 3:
         raise ValueError("seeded mask detection requires an RGB image")
 
-    row = int(seed_point[0])
-    column = int(seed_point[1])
     height, width = rgb_uint8.shape[:2]
-    if row < 0 or row >= height or column < 0 or column >= width:
-        raise ValueError(
-            f"seed point {seed_point} is outside the image bounds {(height, width)}"
-        )
 
     rgb_int16 = rgb_uint8.astype(np.int16)
-    seed_color = rgb_int16[row, column]
-    candidate_mask = np.max(np.abs(rgb_int16 - seed_color[None, None, :]), axis=-1) <= int(color_tolerance)
-    seed_mask = np.zeros((height, width), dtype=bool)
-    seed_mask[row, column] = True
-    invalid_mask = binary_propagation(seed_mask, mask=candidate_mask)
-    valid_mask = ~invalid_mask
+    invalid_mask = np.zeros((height, width), dtype=bool)
+    for row, column in seed_points:
+        if row < 0 or row >= height or column < 0 or column >= width:
+            raise ValueError(
+                f"seed point {(row, column)} is outside the image bounds {(height, width)}"
+            )
+        seed_color = rgb_int16[row, column]
+        candidate_mask = np.max(np.abs(rgb_int16 - seed_color[None, None, :]), axis=-1) <= int(color_tolerance)
+        seed_mask = np.zeros((height, width), dtype=bool)
+        seed_mask[row, column] = True
+        invalid_mask |= binary_propagation(seed_mask, mask=candidate_mask)
+
     if not np.any(invalid_mask):
         raise ValueError("seeded mask detection did not find a connected region to remove")
+
+    region_offset = int(region_offset_pixels)
+    if region_offset > 0:
+        invalid_mask = binary_dilation(
+            invalid_mask,
+            structure=np.ones((3, 3), dtype=bool),
+            iterations=region_offset,
+        )
+    elif region_offset < 0:
+        invalid_mask = binary_erosion(
+            invalid_mask,
+            structure=np.ones((3, 3), dtype=bool),
+            iterations=abs(region_offset),
+            border_value=0,
+        )
+
+    if not np.any(invalid_mask):
+        return np.ones((height, width), dtype=bool)
+
+    valid_mask = ~invalid_mask
     if not np.any(valid_mask):
         raise ValueError("seeded mask detection would remove the entire image")
     return np.asarray(valid_mask, dtype=bool)
@@ -557,7 +611,10 @@ def load_image_data(
     image_path: str,
     *,
     alpha_mask_path: str | None = None,
+    mask_seed_points: list[tuple[int, int]] | tuple[tuple[int, int], ...] | None = None,
     mask_seed_point: tuple[int, int] | None = None,
+    mask_color_tolerance: int = AUTO_MASK_COLOR_TOLERANCE,
+    mask_region_offset: int = 0,
     auto_detect_mask: bool = False,
 ) -> LoadedImageData:
     """Load RGB and alpha coverage data, preserving warnings and alpha provenance."""
@@ -577,6 +634,12 @@ def load_image_data(
         else np.ones(rgb_float.shape[:2], dtype=np.float64)
     )
     embedded_alpha_is_usable = has_embedded_alpha and not np.all(embedded_alpha >= 1.0 - ALPHA_VALID_EPSILON)
+    normalized_seed_points = _normalize_seed_points(mask_seed_points, argument_name="mask seed points")
+    if mask_seed_point is not None:
+        normalized_seed_points = tuple(dict.fromkeys([
+            *normalized_seed_points,
+            *_normalize_seed_points(mask_seed_point, argument_name="mask seed point"),
+        ]))
     mask_prompt_required = False
 
     if resolved_alpha_mask_path is not None:
@@ -585,8 +648,13 @@ def load_image_data(
     elif embedded_alpha_is_usable:
         alpha_float = embedded_alpha
         alpha_source = "embedded"
-    elif mask_seed_point is not None:
-        alpha_float = detect_seeded_valid_mask(rgb_float, mask_seed_point).astype(np.float64)
+    elif normalized_seed_points:
+        alpha_float = detect_seeded_valid_mask(
+            rgb_float,
+            normalized_seed_points,
+            color_tolerance=mask_color_tolerance,
+            region_offset_pixels=mask_region_offset,
+        ).astype(np.float64)
         alpha_source = "interactive-seed"
     elif auto_detect_mask:
         alpha_float = detect_auto_valid_mask(rgb_float).astype(np.float64)
@@ -622,14 +690,20 @@ def load_image(
     image_path: str,
     *,
     alpha_mask_path: str | None = None,
+    mask_seed_points: list[tuple[int, int]] | tuple[tuple[int, int], ...] | None = None,
     mask_seed_point: tuple[int, int] | None = None,
+    mask_color_tolerance: int = AUTO_MASK_COLOR_TOLERANCE,
+    mask_region_offset: int = 0,
     auto_detect_mask: bool = False,
 ):
     """Load an image and return the legacy RGB / Oklch / valid-mask triple."""
     loaded_image = load_image_data(
         image_path,
         alpha_mask_path=alpha_mask_path,
+        mask_seed_points=mask_seed_points,
         mask_seed_point=mask_seed_point,
+        mask_color_tolerance=mask_color_tolerance,
+        mask_region_offset=mask_region_offset,
         auto_detect_mask=auto_detect_mask,
     )
     return loaded_image.rgb_float, loaded_image.oklch_float, loaded_image.valid_mask

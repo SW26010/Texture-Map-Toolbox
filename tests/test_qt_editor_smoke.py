@@ -59,6 +59,12 @@ class QtEditorSmokeTests(unittest.TestCase):
         rgb[2:6, 2:6] = np.array([220, 140, 60], dtype=np.uint8)
         Image.fromarray(rgb, mode="RGB").save(path)
 
+    def _write_multi_seed_mask_source(self, path: Path):
+        rgb = np.full((8, 8, 3), 220, dtype=np.uint8)
+        rgb[0:2, 0:2] = np.array([10, 10, 10], dtype=np.uint8)
+        rgb[0:2, 6:8] = np.array([40, 40, 40], dtype=np.uint8)
+        Image.fromarray(rgb, mode="RGB").save(path)
+
     def test_qt_launcher_builds_and_opens_editor_offscreen(self):
         launcher = build_qt_editor_launcher()
         try:
@@ -241,6 +247,30 @@ class QtEditorSmokeTests(unittest.TestCase):
             finally:
                 dialog.close()
 
+    def test_qt_target_picker_seed_mode_supports_multiple_seeds_and_sliders(self):
+        _ensure_qt_application()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "multi-seed-mask-source.png"
+            self._write_multi_seed_mask_source(image_path)
+
+            dialog = QtTargetImagePickerDialog(
+                None,
+                initial_image_path=str(image_path),
+                initial_mask_mode="interactive-seed",
+            )
+            try:
+                dialog.seed_mask_controls.color_tolerance_slider.setValue(0)
+                dialog.seed_mask_controls.region_offset_slider.setValue(1)
+                dialog._handle_image_preview_click(0, 0)
+                dialog._handle_image_preview_click(0, 7)
+
+                self.assertEqual(dialog.selected_mask_seed_points(), ((0, 0), (0, 7)))
+                self.assertEqual(dialog.image_preview_label._marker_points, ((0, 0), (0, 7)))
+                self.assertIn("Color tolerance: 0", dialog.mask_preview_info_label.text())
+                self.assertIn("Region offset: +1 px", dialog.mask_preview_info_label.text())
+            finally:
+                dialog.close()
+
     def test_qt_target_picker_browse_mask_updates_live_preview(self):
         _ensure_qt_application()
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -302,18 +332,26 @@ class QtEditorSmokeTests(unittest.TestCase):
 
     def test_qt_launcher_seed_mode_previews_and_opens_editor(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            image_path = Path(temp_dir) / "auto-mask-source.png"
-            self._write_auto_mask_source(image_path)
+            image_path = Path(temp_dir) / "multi-seed-mask-source.png"
+            self._write_multi_seed_mask_source(image_path)
 
             launcher = build_qt_editor_launcher(image_path=str(image_path))
             editor_window = None
             try:
                 launcher.pick_region_radio.setChecked(True)
+                launcher.seed_mask_controls.color_tolerance_slider.setValue(0)
+                launcher.seed_mask_controls.region_offset_slider.setValue(1)
                 launcher._handle_image_preview_click(0, 0)
+                launcher._handle_image_preview_click(0, 7)
                 self.assertIn("connected-region", launcher.mask_preview_info_label.text())
+                self.assertEqual(launcher.input_image_preview_label._marker_points, ((0, 0), (0, 7)))
                 editor_window = launcher.launch_selected_editor(show_window=False)
                 self.assertIsNotNone(editor_window)
                 self.assertEqual(editor_window.alpha_source, "interactive-seed")
+                self.assertFalse(editor_window.valid_mask[0, 0])
+                self.assertFalse(editor_window.valid_mask[0, 7])
+                self.assertFalse(editor_window.valid_mask[2, 2])
+                self.assertTrue(editor_window.valid_mask[4, 4])
             finally:
                 if editor_window is not None:
                     editor_window.close()
