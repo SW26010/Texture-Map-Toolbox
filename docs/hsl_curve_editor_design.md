@@ -8,15 +8,22 @@
 - `Ct(L')`：最终 Lightness 到输出 Chroma 的映射
 - `ht(L')`：最终 Lightness 到输出 Hue 的映射
 
-**当前实现**：[`scripts/hsl_curve_editor.py`](../scripts/hsl_curve_editor.py)
+**当前 GUI 实现**：[`texture_map_toolbox/gui/editor.py`](../texture_map_toolbox/gui/editor.py)
 
-**推荐 CLI 入口**：`python -m scripts.cli editor ...`
+**推荐 CLI 入口**：`python -m texture_map_toolbox editor ...`
 
-该编辑器已经和 [`scripts/luma_color_map.py`](../scripts/luma_color_map.py) 共用同一套 Oklch 主流程，默认状态下会继承基础模型，因此在未手动改曲线时，和离线主脚本的默认输出一致。
+该编辑器已经和 [`texture_map_toolbox/core/luma.py`](../texture_map_toolbox/core/luma.py) 共用同一套 Oklch 主流程，默认状态下会继承基础模型，因此在未手动改曲线时，和离线主脚本的默认输出一致。
 
 ---
 
 ## 当前架构
+
+当前层级关系为：
+
+- Core：[`texture_map_toolbox/core/luma.py`](../texture_map_toolbox/core/luma.py)
+- API：[`texture_map_toolbox/api/luma.py`](../texture_map_toolbox/api/luma.py)
+- GUI：[`texture_map_toolbox/gui/editor.py`](../texture_map_toolbox/gui/editor.py)
+- CLI：[`texture_map_toolbox/cli/editor.py`](../texture_map_toolbox/cli/editor.py)
 
 ### 1. 基础模型
 
@@ -45,7 +52,7 @@
 3. 对 LUT 执行 chroma-only gamut compression
 4. 在缩小预览图上用 `np.take` 做快速查表重着色
 
-这条快速路径现在已经和 CLI 的 `python -m scripts.cli luma --algorithm fast ...` 共用同一组 helper，因此后续 GUI、CLI 和编辑器不会再各自维护一套不同的预览算法实现。
+这条快速路径现在已经和 CLI 的 `python -m texture_map_toolbox luma --algorithm fast ...` 共用同一组 helper，因此后续 GUI、CLI 和编辑器不会再各自维护一套不同的预览算法实现。
 
 这保留了当前 matplotlib 版编辑器最重要的优化点：
 
@@ -67,6 +74,8 @@
 - `Enter`：执行一次全分辨率重建
 
 导出的 JSON 与 [`scripts/luma_color_map.py`](../scripts/luma_color_map.py) 的 `--curves` 输入格式一致，因此可以直接拿来喂主脚本。
+
+如果从 Python 直接集成，建议优先走 [`texture_map_toolbox/api/luma.py`](../texture_map_toolbox/api/luma.py) 而不是兼容脚本路径。
 
 ---
 
@@ -100,11 +109,10 @@
 
 ## 当前限制
 
-1. 文件名仍沿用 [`scripts/hsl_curve_editor.py`](../scripts/hsl_curve_editor.py)，但内部语义已完全切到 Oklch。
-2. Chroma / Hue 默认会继承基础模型关键点，因此点数较多，编辑精度高但 UI 会更密。
-3. 当前没有原生文件对话框，输入图和曲线文件都通过命令行参数传入。
-4. 当前没有“控制点数量调整”面板，也没有数值输入框。
-5. 当前 GUI 仍是 matplotlib 版，重点是验证算法和工作流，不是最终形态。
+1. Chroma / Hue 默认会继承基础模型关键点，因此点数较多，编辑精度高但 UI 会更密。
+2. 当前没有原生文件对话框，输入图和曲线文件都通过命令行参数传入。
+3. 当前没有“控制点数量调整”面板，也没有数值输入框。
+4. 当前 GUI 仍是 matplotlib 版，重点是验证算法和工作流，不是最终形态。
 
 ---
 

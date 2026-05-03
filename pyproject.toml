@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "texture-map-toolbox"
 version = "0.1.0"
@@ -12,3 +16,6 @@ dependencies = [
     "scikit-image>=0.26.0",
     "scipy>=1.17.1",
 ]
+
+[project.scripts]
+texture-map-toolbox = "texture_map_toolbox.__main__:main"

@@ -1,17 +1,5 @@
-"""
-交互式 Oklch 状态曲线编辑器
+"""Matplotlib-based Oklch state curve editor."""
 
-用法：
-    python scripts/hsl_curve_editor.py <图片路径> [--curves 曲线文件]
-
-操作：
-    - 左键拖拽：移动控制点，实时更新预览
-    - 右键点击控制点：重置该控制点到初始值
-    - S / Ctrl+S：导出当前 Lt/Ct/ht 控制点到 JSON
-    - Enter：执行一次全分辨率重建并显示结果
-"""
-
-import argparse
 import json
 import os
 import time
@@ -20,50 +8,29 @@ import matplotlib.pyplot as plt
 import numpy as np
 from scipy.interpolate import PchipInterpolator
 
-if __package__ in {None, ""}:
-    from luma_color_map import (
-        DITHER_STRENGTH,
-        DEFAULT_FAST_LUT_SIZE,
-        DEFAULT_FAST_PREVIEW_SCALE,
-        STATE_CURVE_CTRL_POINTS,
-        apply_luma_preview_lut,
-        apply_precurve_dither,
-        build_oklch_curve_model,
-        build_state_curve_set,
-        build_luma_preview_frame,
-        build_luma_preview_lut,
-        compute_luma_lut_indices,
-        count_luma_preview_gamut_pixels,
-        evaluate_reconstruction,
-        load_image,
-        load_state_curve_overrides,
-        plot_comparison,
-        prepare_control_points,
-        reconstruct_from_state_curves,
-        resolve_input_image_path,
-    )
-else:
-    from .luma_color_map import (
-        DITHER_STRENGTH,
-        DEFAULT_FAST_LUT_SIZE,
-        DEFAULT_FAST_PREVIEW_SCALE,
-        STATE_CURVE_CTRL_POINTS,
-        apply_luma_preview_lut,
-        apply_precurve_dither,
-        build_oklch_curve_model,
-        build_state_curve_set,
-        build_luma_preview_frame,
-        build_luma_preview_lut,
-        compute_luma_lut_indices,
-        count_luma_preview_gamut_pixels,
-        evaluate_reconstruction,
-        load_image,
-        load_state_curve_overrides,
-        plot_comparison,
-        prepare_control_points,
-        reconstruct_from_state_curves,
-        resolve_input_image_path,
-    )
+from texture_map_toolbox.core.luma import (
+    DEFAULT_FAST_LUT_SIZE,
+    DEFAULT_FAST_PREVIEW_SCALE,
+    DITHER_STRENGTH,
+    OklchCurveModel,
+    STATE_CURVE_CTRL_POINTS,
+    apply_luma_preview_lut,
+    apply_precurve_dither,
+    build_luma_preview_frame,
+    build_luma_preview_lut,
+    build_oklch_curve_model,
+    build_state_curve_set,
+    compute_luma_lut_indices,
+    count_luma_preview_gamut_pixels,
+    evaluate_reconstruction,
+    load_image,
+    load_state_curve_overrides,
+    prepare_control_points,
+    reconstruct_from_state_curves,
+    resolve_input_image_path,
+)
+from texture_map_toolbox.gui.matplotlib_runtime import show_figures
+from texture_map_toolbox.gui.luma_plots import plot_comparison
 
 
 PREVIEW_SCALE = DEFAULT_FAST_PREVIEW_SCALE
@@ -72,7 +39,11 @@ CURVE_LINE_SAMPLES = 512
 CURVE_X_DENSE = np.linspace(0.0, 1.0, CURVE_LINE_SAMPLES)
 
 
-def _evaluate_hue_curve(hue_u_interp: PchipInterpolator, hue_v_interp: PchipInterpolator, x_values):
+def _evaluate_hue_curve(
+    hue_u_interp: PchipInterpolator,
+    hue_v_interp: PchipInterpolator,
+    x_values,
+):
     """对 hue 状态曲线求值，返回 0-360°。"""
     hue_u = hue_u_interp(x_values)
     hue_v = hue_v_interp(x_values)
@@ -88,7 +59,7 @@ class OklchCurveEditor:
         rgb_float: np.ndarray,
         oklch_float: np.ndarray,
         valid_mask: np.ndarray,
-        base_model,
+        base_model: OklchCurveModel,
         *,
         initial_curve_overrides: dict | None = None,
         dither_strength: float = DITHER_STRENGTH,
@@ -219,7 +190,8 @@ class OklchCurveEditor:
 
     def _build_ui(self):
         self.fig = plt.figure(figsize=(16, 9))
-        self.fig.canvas.manager.set_window_title("Oklch State Curve Editor")
+        if self.fig.canvas.manager is not None:
+            self.fig.canvas.manager.set_window_title("Oklch State Curve Editor")
 
         grid = self.fig.add_gridspec(
             3,
@@ -335,7 +307,7 @@ class OklchCurveEditor:
             print(f"Delta E 2000 ({key.replace('_', ' ').title()}): {value:.2f}")
 
         plot_comparison(self.rgb_float, y_eval, recolored_rgb_int, self.valid_mask, psnr, delta_e_image)
-        plt.show(block=False)
+        show_figures(block=False)
 
     def _connect_events(self):
         self.fig.canvas.mpl_connect("button_press_event", self._on_press)
@@ -403,7 +375,7 @@ class OklchCurveEditor:
             self._render_full_resolution()
 
     def show(self):
-        plt.show()
+        show_figures()
 
 
 def launch_editor(
@@ -430,63 +402,11 @@ def launch_editor(
     )
 
 
-def configure_cli_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
-    """向已有 parser 注入编辑器 CLI 参数。"""
-    parser.add_argument(
-        "image_path",
-        nargs="?",
-        help="Input image path. Required unless a local sample image is available.",
-    )
-    parser.add_argument(
-        "--curves",
-        dest="curve_path",
-        help="Optional JSON file containing initial Lt/Ct/ht control points.",
-    )
-    parser.add_argument(
-        "--curve-output",
-        dest="curve_output_path",
-        help="Optional JSON file path used when exporting curves from the editor.",
-    )
-    parser.add_argument(
-        "--dither-strength",
-        type=float,
-        default=DITHER_STRENGTH,
-        help="Optional pre-curve dither amplitude applied on the input lightness axis.",
-    )
-    return parser
-
-
-def build_arg_parser() -> argparse.ArgumentParser:
-    """构建编辑器命令行 parser。"""
-    return configure_cli_parser(
-        argparse.ArgumentParser(description="Interactive Oklch state-curve editor.")
-    )
-
-
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    """解析编辑器命令行参数。"""
-    return build_arg_parser().parse_args(argv)
-
-
-def execute_cli(args: argparse.Namespace) -> int:
-    """执行编辑器 CLI。"""
-    resolved_image_path = resolve_input_image_path(args.image_path)
-    print(f"Loading: {resolved_image_path}")
-    print("Building Oklch base model done. Opening editor...")
-    editor = launch_editor(
-        resolved_image_path,
-        curve_path=args.curve_path,
-        curve_output_path=args.curve_output_path,
-        dither_strength=args.dither_strength,
-    )
-    editor.show()
-    return 0
-
-
-def main(argv: list[str] | None = None) -> int:
-    """编辑器 CLI 入口。"""
-    return execute_cli(parse_args(argv))
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+__all__ = [
+    "CURVE_LINE_SAMPLES",
+    "CURVE_X_DENSE",
+    "OklchCurveEditor",
+    "PREVIEW_LUT_SIZE",
+    "PREVIEW_SCALE",
+    "launch_editor",
+]

@@ -2,7 +2,16 @@
 
 ## 概述
 
-从一张彩色图像出发，先转换到 Oklch，再使用原始 Oklch 的 Lightness ($L_0$) 作为输入轴 $y$。脚本直接从 per-pixel 样本云拟合连续的 $C(y)$ / $h(y)$，并据此重建图像。
+从一张彩色图像出发，先转换到 Oklch，再使用原始 Oklch 的 Lightness ($L_0$) 作为输入轴 $y$。当前实现已经拆成 core、API、GUI、CLI 四层：算法通过 core 复用，外部程序集成通过 API 进入，绘图与编辑器通过 GUI 层复用，CLI 只负责交互与调度。
+
+## 分层入口
+
+- Core：[`texture_map_toolbox/core/luma.py`](../texture_map_toolbox/core/luma.py)
+- API：[`texture_map_toolbox/api/luma.py`](../texture_map_toolbox/api/luma.py)
+- GUI 绘图：[`texture_map_toolbox/gui/luma_plots.py`](../texture_map_toolbox/gui/luma_plots.py)
+- CLI：[`texture_map_toolbox/cli/luma.py`](../texture_map_toolbox/cli/luma.py)
+
+如果调用方没有显式提供图片路径，当前默认样例图会回退到 [`data/mtmtPonyTail_custom.png`](../data/mtmtPonyTail_custom.png)。
 
 ## 原理
 
@@ -71,25 +80,33 @@
 
 ## 当前实现说明
 
-- 当前脚本已全面抛弃 BT.709 灰度和 HSL 分析路径。
-- 当前脚本主流程已显式经过 `L_t / C_t / h_t` 状态曲线层；默认控制点为 identity Lightness 加基础模型的 Chroma / Hue 关键点。
-- 当前脚本默认关闭预曲线抖动（`DITHER_STRENGTH = 0.0`），但保留了在输入轴 $y$ 上先加抖动再求值的接口。
-- 当前脚本在统一接口下同时保留两种算法：
+- 当前数值主链路已全面抛弃 BT.709 灰度和 HSL 分析路径。
+- 当前主流程已显式经过 `L_t / C_t / h_t` 状态曲线层；默认控制点为 identity Lightness 加基础模型的 Chroma / Hue 关键点。
+- 当前默认关闭预曲线抖动（`DITHER_STRENGTH = 0.0`），但保留了在输入轴 $y$ 上先加抖动再求值的接口。
+- 当前在统一接口下同时保留两种算法：
    - `original`: 原始离线高质量主流程
    - `fast`: 与未来 GUI 共用的快速 LUT 预览算法
+
+推荐从 API 层直接集成：
+
+```python
+from texture_map_toolbox.api.luma import LumaExecutionRequest, run_luma_workflow
+
+result = run_luma_workflow(
+   LumaExecutionRequest(
+      image_path="path/to/image.png",
+      algorithm="original",
+      show_plots=False,
+   )
+)
+```
 
 ## CLI 调用
 
 推荐通过统一 CLI 调用：
 
 ```bash
-python -m scripts.cli luma path/to/image.png --algorithm original --curves path/to/curves.json
-```
-
-兼容旧入口：
-
-```bash
-python scripts/luma_color_map.py path/to/image.png --algorithm original --curves path/to/curves.json
+python -m texture_map_toolbox luma path/to/image.png --algorithm original --curves path/to/curves.json
 ```
 
 额外的 CLI 选项：
@@ -114,7 +131,7 @@ python scripts/luma_color_map.py path/to/image.png --algorithm original --curves
 示例：
 
 ```bash
-python -m scripts.cli luma path/to/image.png --algorithm fast --preview-scale 0.25 --preview-lut-size 512 --output-image path/to/preview.png
+python -m texture_map_toolbox luma path/to/image.png --algorithm fast --preview-scale 0.25 --preview-lut-size 512 --output-image path/to/preview.png
 ```
 
 该模式的目标是与 GUI 共享预览路径，不替代 `original` 模式的最终高质量生成。
@@ -124,7 +141,7 @@ python -m scripts.cli luma path/to/image.png --algorithm fast --preview-scale 0.
 推荐 GUI 或外部流程通过 JSON 与 CLI 交换数据：
 
 ```bash
-python -m scripts.cli luma --request-json docs/examples/luma_request.fast.json
+python -m texture_map_toolbox luma --request-json docs/examples/luma_request.fast.json
 ```
 
 request JSON 示例：
@@ -136,10 +153,26 @@ request JSON 示例：
 
 ## 外部控制点输入
 
-脚本支持通过 JSON 文件注入外部控制点：
+API / CLI 都支持通过 JSON 文件注入外部控制点：
 
 ```bash
-python -m scripts.cli luma path/to/image.png --algorithm original --curves path/to/curves.json
+python -m texture_map_toolbox luma path/to/image.png --algorithm original --curves path/to/curves.json
+```
+
+## 测试覆盖
+
+当前仓库提供一套基于 [`data/mtmtPonyTail_custom.png`](../data/mtmtPonyTail_custom.png) 的 smoke tests，覆盖：
+
+- core 工作流
+- API 调用
+- CLI 参数和 request JSON
+- matplotlib 绘图 helper
+- 编辑器初始化、导出和全分辨率重建
+
+运行方式：
+
+```bash
+python -m unittest tests.test_luma_smoke
 ```
 
 JSON 顶层是一个对象，可包含以下键：
