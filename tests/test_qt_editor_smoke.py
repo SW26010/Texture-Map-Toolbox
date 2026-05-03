@@ -206,6 +206,50 @@ class QtEditorSmokeTests(unittest.TestCase):
         finally:
             window.close()
 
+    def test_qt_editor_hue_wraps_and_display_window_can_shift(self):
+        window = build_qt_editor(SAMPLE_IMAGE)
+        try:
+            window.show()
+            QtWidgets.QApplication.processEvents()
+
+            hue_points = np.array(
+                [
+                    [0.0, 350.0],
+                    [0.5, 10.0],
+                    [1.0, 20.0],
+                ],
+                dtype=np.float64,
+            )
+            window._apply_control_points(2, hue_points, rerender=False, override_enabled=True)
+
+            sampled_hue = window._sample_effective_curve_values(
+                2,
+                np.array([0.125, 0.25, 0.375], dtype=np.float64),
+            )
+            self.assertTrue(np.all((sampled_hue >= 0.0) & (sampled_hue < 360.0)))
+            self.assertGreater(float(sampled_hue[0]), 350.0)
+            self.assertLess(float(sampled_hue[1]), 20.0)
+
+            window._set_hue_display_start(300)
+
+            self.assertEqual(window.hue_display_start_slider.value(), 300)
+            self.assertEqual(window._current_hue_display_range(), (300.0, 660.0))
+            displayed_positions = window.hue_plot.control_item.positions()
+            self.assertTrue(
+                np.allclose(
+                    displayed_positions[:, 1],
+                    window._map_hue_values_to_display_window(window.ctrl_y[2]),
+                )
+            )
+            self.assertGreater(float(np.max(displayed_positions[:, 1])), 360.0)
+            self._assert_plot_background_matches_y_direction(
+                window.hue_plot,
+                window._build_hue_background(window._build_state_curves()),
+                window._current_hue_display_range(),
+            )
+        finally:
+            window.close()
+
     def test_editor_cli_dispatches_to_qt_backend(self):
         with mock.patch("texture_map_toolbox.gui.qt_editor.launch_qt_editor") as launch_qt_editor:
             args = editor_cli.parse_args([

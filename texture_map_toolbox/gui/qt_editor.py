@@ -64,6 +64,9 @@ CURVE_EDITOR_OVERRIDE_KEYS = (
 CURVE_EDITOR_SAVE_KEYS = ("lightness", "chroma", "hue")
 CURVE_EDITOR_MODE_DEFAULT = "Original curve active"
 CURVE_EDITOR_MODE_EDITED = "Editable key points active"
+HUE_DISPLAY_WINDOW_SPAN = 360.0
+HUE_DISPLAY_START_MIN = 0
+HUE_DISPLAY_START_MAX = 359
 MASK_COLOR_TOLERANCE_MAX = 64
 MASK_REGION_OFFSET_MIN = -64
 MASK_REGION_OFFSET_MAX = 64
@@ -1555,6 +1558,9 @@ class QtOklchCurveEditorWindow(QtWidgets.QMainWindow):
         self._last_target_mask_dialog_path: str | None = None
         self._last_target_mask_mode = "image-alpha"
         self._default_curve_lines = self._build_default_curve_lines()
+        self.hue_display_start = float(HUE_DISPLAY_START_MIN)
+        self.hue_display_start_slider: QtWidgets.QSlider | None = None
+        self.hue_display_start_value_label: QtWidgets.QLabel | None = None
 
         self._build_preview_inputs()
         self._initialize_controls(initial_curve_overrides or {})
@@ -1657,6 +1663,72 @@ class QtOklchCurveEditorWindow(QtWidgets.QMainWindow):
             return np.clip(resolved_state_curves.chroma_interp(x_values), 0.0, None)
         return _evaluate_hue_curve(resolved_state_curves.hue_u_interp, resolved_state_curves.hue_v_interp, x_values)
 
+    def _current_hue_display_range(self) -> tuple[float, float]:
+        """Return the currently visible continuous 360-degree hue window."""
+        start = float(self.hue_display_start)
+        return (start, start + HUE_DISPLAY_WINDOW_SPAN)
+
+    def _map_hue_values_to_display_window(
+        self,
+        hue_values: np.ndarray,
+        *,
+        start: float | None = None,
+    ) -> np.ndarray:
+        """Map canonical [0, 360) hue values into the active shifted display window."""
+        resolved_start = float(self.hue_display_start if start is None else start)
+        hue_values = np.asarray(hue_values, dtype=np.float64)
+        return np.mod(hue_values - resolved_start, HUE_DISPLAY_WINDOW_SPAN) + resolved_start
+
+    def _sync_hue_display_controls(self):
+        """Keep the hue-window widgets aligned with the current display start."""
+        slider = getattr(self, "hue_display_start_slider", None)
+        if slider is not None:
+            blocker = QtCore.QSignalBlocker(slider)
+            slider.setValue(int(round(self.hue_display_start)))
+            del blocker
+
+        value_label = getattr(self, "hue_display_start_value_label", None)
+        if value_label is not None:
+            start = int(round(self.hue_display_start))
+            value_label.setText(f"{start} to {start + int(HUE_DISPLAY_WINDOW_SPAN)} deg")
+
+    def _refresh_hue_plot_display(
+        self,
+        *,
+        state_curves=None,
+        hue_line: np.ndarray | None = None,
+    ):
+        """Refresh only the hue plot after display-window or control-point changes."""
+        if not hasattr(self, "hue_plot"):
+            return
+
+        resolved_state_curves = state_curves or self._build_state_curves()
+        resolved_hue_line = (
+            np.asarray(hue_line, dtype=np.float64)
+            if hue_line is not None
+            else self._sample_effective_curve_values(2, CURVE_X_DENSE, state_curves=resolved_state_curves)
+        )
+        self.hue_plot.set_y_range(self._current_hue_display_range())
+        self.hue_plot.set_background_rgb(self._build_hue_background(resolved_state_curves))
+        self.hue_plot.set_default_line(self._map_hue_values_to_display_window(self._default_curve_lines[2]))
+        self.hue_plot.set_curve_line(self._map_hue_values_to_display_window(resolved_hue_line))
+        self.hue_plot.set_control_points(
+            self.ctrl_x[2],
+            self._map_hue_values_to_display_window(self.ctrl_y[2]),
+        )
+        self.hue_plot.set_histogram(None, None)
+        self.hue_plot.set_reference_histogram(None, None)
+        self._sync_hue_display_controls()
+
+    def _set_hue_display_start(self, start_degrees: int):
+        """Shift the visible hue window without modifying the stored curve."""
+        resolved_start = int(np.clip(int(start_degrees), HUE_DISPLAY_START_MIN, HUE_DISPLAY_START_MAX))
+        if resolved_start == int(round(self.hue_display_start)):
+            self._sync_hue_display_controls()
+            return
+        self.hue_display_start = float(resolved_start)
+        self._refresh_hue_plot_display()
+
     def _build_curve_panel(self, curve_index: int, plot_widget: CurvePlotWidget) -> QtWidgets.QWidget:
         """Wrap one plot with point-count and reset controls."""
         panel = QtWidgets.QWidget()
@@ -1687,6 +1759,34 @@ class QtOklchCurveEditorWindow(QtWidgets.QMainWindow):
         controls_layout.addWidget(mode_label)
 
         panel_layout.addLayout(controls_layout)
+        if curve_index == 2:
+            hue_window_layout = QtWidgets.QHBoxLayout()
+            hue_window_layout.setContentsMargins(0, 0, 0, 0)
+            hue_window_layout.setSpacing(8)
+
+            hue_window_label = QtWidgets.QLabel("Hue Window Start")
+            hue_window_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+            hue_window_slider.setRange(HUE_DISPLAY_START_MIN, HUE_DISPLAY_START_MAX)
+            hue_window_slider.setSingleStep(1)
+            hue_window_slider.setPageStep(15)
+            hue_window_slider.setValue(int(round(self.hue_display_start)))
+            hue_window_slider.setToolTip(
+                "Shift the visible 360-degree hue window without changing the stored hue curve."
+            )
+
+            hue_window_value_label = QtWidgets.QLabel()
+            hue_window_value_label.setMinimumWidth(120)
+
+            hue_window_layout.addWidget(hue_window_label)
+            hue_window_layout.addWidget(hue_window_slider, 1)
+            hue_window_layout.addWidget(hue_window_value_label)
+            panel_layout.addLayout(hue_window_layout)
+
+            hue_window_slider.valueChanged.connect(self._set_hue_display_start)
+            self.hue_display_start_slider = hue_window_slider
+            self.hue_display_start_value_label = hue_window_value_label
+            self._sync_hue_display_controls()
+
         panel_layout.addWidget(plot_widget, 1)
 
         points_spin_box.valueChanged.connect(
@@ -1864,7 +1964,7 @@ class QtOklchCurveEditorWindow(QtWidgets.QMainWindow):
             title="Hue State ht(L')",
             x_label="Output Lightness L'",
             y_label="Output Hue h' (deg)",
-            y_range=(0.0, 360.0),
+            y_range=self._current_hue_display_range(),
             fixed_x=self.ctrl_x[2],
             line_pen=pg.mkPen("#ff6b57", width=2.5),
             point_brush=pg.mkBrush("#ff6b57"),
@@ -1872,7 +1972,7 @@ class QtOklchCurveEditorWindow(QtWidgets.QMainWindow):
 
         self.lightness_plot.set_default_line(self._default_curve_lines[0])
         self.chroma_plot.set_default_line(self._default_curve_lines[1])
-        self.hue_plot.set_default_line(self._default_curve_lines[2])
+        self.hue_plot.set_default_line(self._map_hue_values_to_display_window(self._default_curve_lines[2]))
 
         curves_layout.addWidget(self._build_curve_panel(0, self.lightness_plot), 1)
         curves_layout.addWidget(self._build_curve_panel(1, self.chroma_plot), 1)
@@ -2160,12 +2260,15 @@ class QtOklchCurveEditorWindow(QtWidgets.QMainWindow):
     def _build_hue_background(self, state_curves) -> np.ndarray:
         """Build the hue-panel background using current chroma along x."""
         lightness_x = np.linspace(0.0, 1.0, CURVE_BACKGROUND_WIDTH, dtype=np.float64)
-        hue_y = np.linspace(0.0, 360.0, CURVE_BACKGROUND_HEIGHT, dtype=np.float64)[:, None]
+        hue_y = np.linspace(*self._current_hue_display_range(), CURVE_BACKGROUND_HEIGHT, dtype=np.float64)[:, None]
         chroma_x = np.clip(state_curves.chroma_interp(lightness_x), 0.0, None)
 
         lightness_grid = np.broadcast_to(lightness_x[None, :], (CURVE_BACKGROUND_HEIGHT, CURVE_BACKGROUND_WIDTH))
         chroma_grid = np.broadcast_to(chroma_x[None, :], (CURVE_BACKGROUND_HEIGHT, CURVE_BACKGROUND_WIDTH))
-        hue_grid = np.broadcast_to(hue_y, (CURVE_BACKGROUND_HEIGHT, CURVE_BACKGROUND_WIDTH))
+        hue_grid = np.mod(
+            np.broadcast_to(hue_y, (CURVE_BACKGROUND_HEIGHT, CURVE_BACKGROUND_WIDTH)),
+            HUE_DISPLAY_WINDOW_SPAN,
+        )
         oklch_grid = np.stack([lightness_grid, chroma_grid, hue_grid], axis=-1)
         _, rgb_float, _ = compress_oklch_chroma_to_srgb(oklch_grid)
         return _rgb_float_to_uint8(rgb_float)
@@ -2214,11 +2317,7 @@ class QtOklchCurveEditorWindow(QtWidgets.QMainWindow):
         self.chroma_plot.set_histogram(None, None)
         self.chroma_plot.set_reference_histogram(None, None)
 
-        self.hue_plot.set_background_rgb(self._build_hue_background(state_curves))
-        self.hue_plot.set_curve_line(hue_line)
-        self.hue_plot.set_control_points(self.ctrl_x[2], self.ctrl_y[2])
-        self.hue_plot.set_histogram(None, None)
-        self.hue_plot.set_reference_histogram(None, None)
+        self._refresh_hue_plot_display(state_curves=state_curves, hue_line=hue_line)
 
         self.preview_image_label.set_rgb_uint8(self._preview_buf)
         draw_done = time.perf_counter()
