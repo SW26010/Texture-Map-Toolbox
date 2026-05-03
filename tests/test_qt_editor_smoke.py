@@ -6,13 +6,19 @@ from unittest import mock
 
 import numpy as np
 from PIL import Image
+from PySide6 import QtWidgets
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from texture_map_toolbox import __main__ as package_main
 from texture_map_toolbox.api.luma import resolve_input_image_path
 from texture_map_toolbox.cli import editor as editor_cli
-from texture_map_toolbox.gui.qt_editor import build_qt_editor, build_qt_editor_launcher
+from texture_map_toolbox.gui.qt_editor import (
+    QtTargetImagePickerDialog,
+    _ensure_qt_application,
+    build_qt_editor,
+    build_qt_editor_launcher,
+)
 
 
 SAMPLE_IMAGE = resolve_input_image_path(None)
@@ -35,6 +41,23 @@ class QtEditorSmokeTests(unittest.TestCase):
             dtype=np.uint8,
         )
         Image.fromarray(np.dstack([rgb, alpha]), mode="RGBA").save(path)
+
+    def _write_grayscale_mask(self, path: Path):
+        Image.fromarray(
+            np.array(
+                [
+                    [0, 255, 255],
+                    [0, 255, 255],
+                ],
+                dtype=np.uint8,
+            ),
+            mode="L",
+        ).save(path)
+
+    def _write_auto_mask_source(self, path: Path):
+        rgb = np.full((8, 8, 3), 10, dtype=np.uint8)
+        rgb[2:6, 2:6] = np.array([220, 140, 60], dtype=np.uint8)
+        Image.fromarray(rgb, mode="RGB").save(path)
 
     def test_qt_launcher_builds_and_opens_editor_offscreen(self):
         launcher = build_qt_editor_launcher()
@@ -144,6 +167,157 @@ class QtEditorSmokeTests(unittest.TestCase):
             )
         finally:
             window.close()
+
+    def test_qt_target_image_selection_uses_external_mask(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target_path = Path(temp_dir) / "target.png"
+            mask_path = Path(temp_dir) / "mask.png"
+            self._write_rgba_image(target_path)
+            self._write_grayscale_mask(mask_path)
+
+            window = build_qt_editor(SAMPLE_IMAGE)
+            try:
+                loaded_image, _, _ = window._load_target_curve_model(
+                    str(target_path),
+                    alpha_mask_path=str(mask_path),
+                    show_warnings=False,
+                )
+                self.assertEqual(loaded_image.alpha_source, "external-mask")
+                self.assertEqual(loaded_image.alpha_mask_path, str(mask_path.resolve()))
+
+                window.apply_target_image_selection(
+                    str(target_path),
+                    alpha_mask_path=str(mask_path),
+                    apply_lightness=True,
+                    apply_chroma=False,
+                    apply_hue=False,
+                    show_warnings=False,
+                )
+                self.assertEqual(window.target_curve_mask_paths["lightness"], str(mask_path.resolve()))
+            finally:
+                window.close()
+
+    def test_qt_target_picker_shows_live_image_and_mask_previews(self):
+        _ensure_qt_application()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "target.png"
+            mask_path = Path(temp_dir) / "mask.png"
+            self._write_rgba_image(image_path)
+            self._write_grayscale_mask(mask_path)
+
+            dialog = QtTargetImagePickerDialog(
+                None,
+                initial_image_path=str(image_path),
+                initial_mask_path=str(mask_path),
+                initial_mask_mode="external",
+            )
+            try:
+                self.assertTrue(dialog.load_mask_radio.isChecked())
+                self.assertIsNotNone(dialog.image_preview_label._pixmap)
+                self.assertIsNotNone(dialog.mask_preview_label._pixmap)
+                self.assertIn("Shape: 3 x 2", dialog.image_preview_info_label.text())
+                self.assertIn("Matches selected image size", dialog.mask_preview_info_label.text())
+                self.assertEqual(dialog.selected_mask_path(), str(mask_path))
+            finally:
+                dialog.close()
+
+    def test_qt_target_picker_seed_mode_shows_mask_preview_after_click(self):
+        _ensure_qt_application()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "auto-mask-source.png"
+            self._write_auto_mask_source(image_path)
+
+            dialog = QtTargetImagePickerDialog(
+                None,
+                initial_image_path=str(image_path),
+                initial_mask_mode="interactive-seed",
+            )
+            try:
+                self.assertTrue(dialog.pick_region_radio.isChecked())
+                dialog._handle_image_preview_click(0, 0)
+                self.assertIsNotNone(dialog.mask_preview_label._pixmap)
+                self.assertIn("connected-region", dialog.mask_preview_info_label.text())
+                self.assertEqual(dialog.selected_mask_seed_point(), (0, 0))
+            finally:
+                dialog.close()
+
+    def test_qt_target_picker_browse_mask_updates_live_preview(self):
+        _ensure_qt_application()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "target.png"
+            mask_path = Path(temp_dir) / "mask.png"
+            self._write_rgba_image(image_path)
+            self._write_grayscale_mask(mask_path)
+
+            dialog = QtTargetImagePickerDialog(None, initial_image_path=str(image_path))
+            try:
+                with mock.patch(
+                    "PySide6.QtWidgets.QFileDialog.getOpenFileName",
+                    return_value=(str(mask_path), "Images (*.png)"),
+                ):
+                    dialog._browse_mask()
+                self.assertTrue(dialog.load_mask_radio.isChecked())
+                self.assertEqual(dialog.selected_mask_path(), str(mask_path))
+                self.assertIsNotNone(dialog.mask_preview_label._pixmap)
+            finally:
+                dialog.close()
+
+    def test_qt_launcher_shows_live_image_and_mask_previews(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "source.png"
+            mask_path = Path(temp_dir) / "mask.png"
+            self._write_rgba_image(image_path)
+            self._write_grayscale_mask(mask_path)
+
+            launcher = build_qt_editor_launcher(image_path=str(image_path), alpha_mask_path=str(mask_path))
+            try:
+                self.assertTrue(launcher.load_mask_radio.isChecked())
+                self.assertIsNotNone(launcher.input_image_preview_label._pixmap)
+                self.assertIsNotNone(launcher.mask_preview_label._pixmap)
+                self.assertIn("Shape: 3 x 2", launcher.input_image_info_label.text())
+                self.assertIn("Matches selected image size", launcher.mask_preview_info_label.text())
+                self.assertEqual(launcher.alpha_mask_path_edit.text(), str(mask_path))
+            finally:
+                launcher.close()
+
+    def test_qt_launcher_browse_mask_updates_live_preview(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "source.png"
+            mask_path = Path(temp_dir) / "mask.png"
+            self._write_rgba_image(image_path)
+            self._write_grayscale_mask(mask_path)
+
+            launcher = build_qt_editor_launcher(image_path=str(image_path))
+            try:
+                with mock.patch(
+                    "PySide6.QtWidgets.QFileDialog.getOpenFileName",
+                    return_value=(str(mask_path), "Images (*.png)"),
+                ):
+                    launcher._browse_alpha_mask()
+                self.assertTrue(launcher.load_mask_radio.isChecked())
+                self.assertEqual(launcher.alpha_mask_path_edit.text(), str(mask_path))
+                self.assertIsNotNone(launcher.mask_preview_label._pixmap)
+            finally:
+                launcher.close()
+
+    def test_qt_launcher_seed_mode_previews_and_opens_editor(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "auto-mask-source.png"
+            self._write_auto_mask_source(image_path)
+
+            launcher = build_qt_editor_launcher(image_path=str(image_path))
+            editor_window = None
+            try:
+                launcher.pick_region_radio.setChecked(True)
+                launcher._handle_image_preview_click(0, 0)
+                self.assertIn("connected-region", launcher.mask_preview_info_label.text())
+                editor_window = launcher.launch_selected_editor(show_window=False)
+                self.assertIsNotNone(editor_window)
+                self.assertEqual(editor_window.alpha_source, "interactive-seed")
+            finally:
+                if editor_window is not None:
+                    editor_window.close()
+                launcher.close()
 
 
 if __name__ == "__main__":

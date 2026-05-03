@@ -85,6 +85,19 @@ class AlphaInputValidationTests(unittest.TestCase):
             self.assertTrue(loaded_image.valid_mask[3, 3])
             self.assertTrue(any("auto-detected border mask" in warning for warning in loaded_image.image_warnings))
 
+    def test_seed_mask_uses_selected_connected_region(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "seed-mask-source.png"
+            self._write_auto_mask_source(image_path)
+
+            loaded_image = load_image_data(str(image_path), mask_seed_point=(0, 0))
+
+            self.assertEqual(loaded_image.alpha_source, "interactive-seed")
+            self.assertFalse(loaded_image.mask_prompt_required)
+            self.assertFalse(loaded_image.valid_mask[0, 0])
+            self.assertTrue(loaded_image.valid_mask[3, 3])
+            self.assertTrue(any("connected-region mask" in warning for warning in loaded_image.image_warnings))
+
     def test_external_alpha_mask_overrides_embedded_alpha(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             image_path = Path(temp_dir) / "source.png"
@@ -145,34 +158,43 @@ class AlphaInputValidationTests(unittest.TestCase):
             self.assertEqual(result.alpha_mask_path, str(mask_path.resolve()))
             self.assertTrue(any("JPEG" in warning for warning in result.image_warnings))
 
-    def test_qt_editor_launch_shows_warning_for_jpeg_input(self):
+    def test_qt_editor_launch_can_continue_without_extra_mask_after_seed_prompt(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             image_path = Path(temp_dir) / "opaque.jpg"
             self._write_rgb_image(image_path, suffix=".jpg")
 
-            with mock.patch("PySide6.QtWidgets.QMessageBox.warning") as warning_box:
+            window = None
+            dialog = mock.Mock()
+            dialog.exec.return_value = QtWidgets.QDialog.DialogCode.Accepted
+            dialog.continue_without_mask_requested.return_value = True
+            dialog.selected_mask_seed_point.return_value = None
+            with mock.patch("texture_map_toolbox.gui.qt_editor.QtSeedMaskSelectionDialog", return_value=dialog) as dialog_cls:
                 window = launch_qt_editor(str(image_path), run_event_loop=False)
                 try:
-                    warning_box.assert_called_once()
-                    self.assertIn("JPEG", warning_box.call_args.args[2])
+                    dialog_cls.assert_called_once()
+                    self.assertIsNotNone(window)
+                    self.assertEqual(window.alpha_source, "implicit-opaque")
+                    self.assertTrue(window.valid_mask.all())
                 finally:
                     if window is not None:
                         window.close()
 
-    def test_qt_editor_launch_can_auto_detect_mask_when_prompt_confirmed(self):
+    def test_qt_editor_launch_can_use_seed_mask_from_prompt_dialog(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             image_path = Path(temp_dir) / "auto-mask-source.png"
             self._write_auto_mask_source(image_path)
 
-            with mock.patch(
-                "PySide6.QtWidgets.QMessageBox.warning",
-                return_value=QtWidgets.QMessageBox.StandardButton.Yes,
-            ) as warning_box:
+            window = None
+            dialog = mock.Mock()
+            dialog.exec.return_value = QtWidgets.QDialog.DialogCode.Accepted
+            dialog.continue_without_mask_requested.return_value = False
+            dialog.selected_mask_seed_point.return_value = (0, 0)
+            with mock.patch("texture_map_toolbox.gui.qt_editor.QtSeedMaskSelectionDialog", return_value=dialog) as dialog_cls:
                 window = launch_qt_editor(str(image_path), run_event_loop=False)
                 try:
-                    warning_box.assert_called_once()
+                    dialog_cls.assert_called_once()
                     self.assertIsNotNone(window)
-                    self.assertEqual(window.alpha_source, "auto-detected")
+                    self.assertEqual(window.alpha_source, "interactive-seed")
                     self.assertFalse(window.valid_mask[0, 0])
                     self.assertTrue(window.valid_mask[3, 3])
                 finally:

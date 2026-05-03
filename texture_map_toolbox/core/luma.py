@@ -421,6 +421,39 @@ def _candidate_has_edge_run(candidate_mask: np.ndarray, border_width: int, min_e
     return any(_longest_true_run(line) >= int(min_edge_run) for line in edge_lines)
 
 
+def detect_seeded_valid_mask(
+    rgb_float: np.ndarray,
+    seed_point: tuple[int, int],
+    *,
+    color_tolerance: int = AUTO_MASK_COLOR_TOLERANCE,
+) -> np.ndarray:
+    """Return a valid-pixel mask by flood-filling from a user-selected seed pixel."""
+    rgb_uint8 = img_as_ubyte(np.clip(np.asarray(rgb_float, dtype=np.float64), 0.0, 1.0))
+    if rgb_uint8.ndim != 3 or rgb_uint8.shape[2] < 3:
+        raise ValueError("seeded mask detection requires an RGB image")
+
+    row = int(seed_point[0])
+    column = int(seed_point[1])
+    height, width = rgb_uint8.shape[:2]
+    if row < 0 or row >= height or column < 0 or column >= width:
+        raise ValueError(
+            f"seed point {seed_point} is outside the image bounds {(height, width)}"
+        )
+
+    rgb_int16 = rgb_uint8.astype(np.int16)
+    seed_color = rgb_int16[row, column]
+    candidate_mask = np.max(np.abs(rgb_int16 - seed_color[None, None, :]), axis=-1) <= int(color_tolerance)
+    seed_mask = np.zeros((height, width), dtype=bool)
+    seed_mask[row, column] = True
+    invalid_mask = binary_propagation(seed_mask, mask=candidate_mask)
+    valid_mask = ~invalid_mask
+    if not np.any(invalid_mask):
+        raise ValueError("seeded mask detection did not find a connected region to remove")
+    if not np.any(valid_mask):
+        raise ValueError("seeded mask detection would remove the entire image")
+    return np.asarray(valid_mask, dtype=bool)
+
+
 def detect_auto_valid_mask(
     rgb_float: np.ndarray,
     *,
@@ -431,6 +464,8 @@ def detect_auto_valid_mask(
     min_edge_run: int = AUTO_MASK_MIN_EDGE_RUN,
     min_border_pixels: int = AUTO_MASK_MIN_BORDER_PIXELS,
 ) -> np.ndarray:
+    # Deprecated for GUI use after switching to explicit user seed selection.
+    # Keep this implementation for reference, tests, and non-interactive experiments.
     """Auto-detect a border-connected invalid region and return a valid-pixel mask."""
     rgb_uint8 = img_as_ubyte(np.clip(np.asarray(rgb_float, dtype=np.float64), 0.0, 1.0))
     border_mask = _build_border_mask(rgb_uint8.shape[:2], border_width)
@@ -485,6 +520,19 @@ def _build_image_alpha_warnings(
             warnings.append("Input JPEG image has no embedded alpha channel; using the external alpha mask instead.")
         elif opaque_png_alpha:
             warnings.append("Input PNG alpha channel is fully opaque; using the external alpha mask instead.")
+    elif alpha_source == "interactive-seed":
+        if suffix in JPEG_IMAGE_SUFFIXES:
+            warnings.append(
+                "Input JPEG image has no embedded alpha channel; using the user-selected connected-region mask instead."
+            )
+        elif opaque_png_alpha:
+            warnings.append(
+                "Input PNG alpha channel is fully opaque; using the user-selected connected-region mask instead."
+            )
+        elif not has_embedded_alpha:
+            warnings.append(
+                "Input image has no embedded alpha channel; using the user-selected connected-region mask instead."
+            )
     elif alpha_source == "auto-detected":
         if suffix in JPEG_IMAGE_SUFFIXES:
             warnings.append("Input JPEG image has no embedded alpha channel; using the auto-detected border mask instead.")
@@ -509,6 +557,7 @@ def load_image_data(
     image_path: str,
     *,
     alpha_mask_path: str | None = None,
+    mask_seed_point: tuple[int, int] | None = None,
     auto_detect_mask: bool = False,
 ) -> LoadedImageData:
     """Load RGB and alpha coverage data, preserving warnings and alpha provenance."""
@@ -536,6 +585,9 @@ def load_image_data(
     elif embedded_alpha_is_usable:
         alpha_float = embedded_alpha
         alpha_source = "embedded"
+    elif mask_seed_point is not None:
+        alpha_float = detect_seeded_valid_mask(rgb_float, mask_seed_point).astype(np.float64)
+        alpha_source = "interactive-seed"
     elif auto_detect_mask:
         alpha_float = detect_auto_valid_mask(rgb_float).astype(np.float64)
         alpha_source = "auto-detected"
@@ -570,12 +622,14 @@ def load_image(
     image_path: str,
     *,
     alpha_mask_path: str | None = None,
+    mask_seed_point: tuple[int, int] | None = None,
     auto_detect_mask: bool = False,
 ):
     """Load an image and return the legacy RGB / Oklch / valid-mask triple."""
     loaded_image = load_image_data(
         image_path,
         alpha_mask_path=alpha_mask_path,
+        mask_seed_point=mask_seed_point,
         auto_detect_mask=auto_detect_mask,
     )
     return loaded_image.rgb_float, loaded_image.oklch_float, loaded_image.valid_mask
@@ -1395,6 +1449,7 @@ __all__ = [
     "compute_luma_lut_indices",
     "compute_oklab_max_saturation",
     "count_luma_preview_gamut_pixels",
+    "detect_seeded_valid_mask",
     "detect_auto_valid_mask",
     "evaluate_chroma_hue",
     "evaluate_reconstruction",

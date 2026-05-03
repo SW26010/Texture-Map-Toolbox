@@ -8,6 +8,7 @@ import time
 
 import numpy as np
 import pyqtgraph as pg
+from PIL import Image
 from PySide6 import QtCore, QtGui, QtWidgets
 from scipy.interpolate import PchipInterpolator
 
@@ -27,6 +28,7 @@ from texture_map_toolbox.core.luma import (
     compress_oklch_chroma_to_srgb,
     compute_luma_lut_indices,
     count_luma_preview_gamut_pixels,
+    detect_seeded_valid_mask,
     evaluate_reconstruction,
     fit_monotonic_lightness_transfer_curve,
     load_image_data,
@@ -50,6 +52,7 @@ CURVE_BACKGROUND_WIDTH = 512
 CURVE_BACKGROUND_HEIGHT = 256
 LIGHTNESS_HISTOGRAM_BINS = 96
 CURVE_X_DENSE = np.linspace(0.0, 1.0, CURVE_LINE_SAMPLES)
+PIL_PREVIEW_RESAMPLE = Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS
 
 
 def _evaluate_hue_curve(
@@ -120,41 +123,48 @@ def _resolve_qt_mask_loading(
     parent: QtWidgets.QWidget | None,
     image_path: str,
     alpha_mask_path: str | None,
+    mask_seed_point: tuple[int, int] | None,
     *,
     prompt_user: bool,
-) -> tuple[str | None, bool, bool, bool]:
-    """Resolve whether the editor should use an external mask, auto-detect, or continue opaque."""
+) -> tuple[str | None, tuple[int, int] | None, bool, bool]:
+    """Resolve whether the editor should use an external mask, a clicked seed mask, or continue opaque."""
     if alpha_mask_path is not None:
-        return alpha_mask_path, False, False, False
+        return alpha_mask_path, None, False, False
+    if mask_seed_point is not None:
+        return None, mask_seed_point, False, False
 
     loaded_image = load_image_data(image_path)
     if not loaded_image.mask_prompt_required or not prompt_user:
-        return None, False, False, False
+        return None, None, False, False
 
-    button = QtWidgets.QMessageBox.warning(
+    dialog = QtSeedMaskSelectionDialog(
         parent,
-        "No Usable Alpha Mask",
-        "\n\n".join([
-            *loaded_image.image_warnings,
-            "Do you want to try the auto-detect mask feature now?",
-        ]),
-        QtWidgets.QMessageBox.StandardButton.Yes
-        | QtWidgets.QMessageBox.StandardButton.No
-        | QtWidgets.QMessageBox.StandardButton.Cancel,
-        QtWidgets.QMessageBox.StandardButton.Yes,
+        image_path,
+        image_warnings=loaded_image.image_warnings,
     )
-    if button == QtWidgets.QMessageBox.StandardButton.Cancel:
-        return None, False, True, True
-    return None, button == QtWidgets.QMessageBox.StandardButton.Yes, True, False
+    result = dialog.exec()
+    if result == QtWidgets.QDialog.DialogCode.Accepted:
+        if dialog.continue_without_mask_requested():
+            return None, None, True, False
+        return None, dialog.selected_mask_seed_point(), True, False
+    return None, None, True, True
 
 
 class QtTargetImagePickerDialog(QtWidgets.QDialog):
     """Modal dialog for selecting one target image and which L/C/H curves should use it."""
 
-    def __init__(self, parent: QtWidgets.QWidget | None, *, initial_image_path: str | None = None):
+    def __init__(
+        self,
+        parent: QtWidgets.QWidget | None,
+        *,
+        initial_image_path: str | None = None,
+        initial_mask_path: str | None = None,
+        initial_mask_mode: str | None = None,
+    ):
         super().__init__(parent)
         self.setWindowTitle("Load L/C/H Target")
-        self.resize(620, 220)
+        self.resize(1120, 760)
+        self._mask_seed_point: tuple[int, int] | None = None
 
         root_layout = QtWidgets.QVBoxLayout(self)
         root_layout.setContentsMargins(18, 18, 18, 18)
@@ -166,13 +176,44 @@ class QtTargetImagePickerDialog(QtWidgets.QDialog):
         description_label.setWordWrap(True)
         root_layout.addWidget(description_label)
 
+        content_layout = QtWidgets.QHBoxLayout()
+        content_layout.setSpacing(16)
+        root_layout.addLayout(content_layout, 1)
+
+        controls_widget = QtWidgets.QWidget()
+        controls_layout = QtWidgets.QVBoxLayout(controls_widget)
+        controls_layout.setContentsMargins(0, 0, 0, 0)
+        controls_layout.setSpacing(12)
+        content_layout.addWidget(controls_widget, 1)
+
         path_layout = QtWidgets.QHBoxLayout()
         self.image_path_edit = QtWidgets.QLineEdit(initial_image_path or "")
         self.image_path_edit.setPlaceholderText("Target image path")
         self.browse_button = QtWidgets.QPushButton("Browse")
         path_layout.addWidget(self.image_path_edit, 1)
         path_layout.addWidget(self.browse_button)
-        root_layout.addLayout(path_layout)
+        controls_layout.addLayout(path_layout)
+
+        mask_mode_group = QtWidgets.QGroupBox("Mask Source")
+        mask_mode_layout = QtWidgets.QVBoxLayout(mask_mode_group)
+        mask_mode_layout.setSpacing(8)
+        self.use_image_alpha_radio = QtWidgets.QRadioButton("Use image alpha / no extra mask")
+        self.load_mask_radio = QtWidgets.QRadioButton("Load mask file")
+        self.pick_region_radio = QtWidgets.QRadioButton("Pick connected region from image")
+        mask_mode_layout.addWidget(self.use_image_alpha_radio)
+        mask_mode_layout.addWidget(self.load_mask_radio)
+        mask_mode_layout.addWidget(self.pick_region_radio)
+        controls_layout.addWidget(mask_mode_group)
+
+        mask_layout = QtWidgets.QHBoxLayout()
+        self.mask_path_edit = QtWidgets.QLineEdit(initial_mask_path or "")
+        self.mask_path_edit.setPlaceholderText("Optional target mask path")
+        self.mask_browse_button = QtWidgets.QPushButton("Browse Mask")
+        self.mask_clear_button = QtWidgets.QPushButton("Clear Mask")
+        mask_layout.addWidget(self.mask_path_edit, 1)
+        mask_layout.addWidget(self.mask_browse_button)
+        mask_layout.addWidget(self.mask_clear_button)
+        controls_layout.addLayout(mask_layout)
 
         checkbox_layout = QtWidgets.QHBoxLayout()
         self.lightness_checkbox = QtWidgets.QCheckBox("Apply to L")
@@ -182,7 +223,34 @@ class QtTargetImagePickerDialog(QtWidgets.QDialog):
         checkbox_layout.addWidget(self.chroma_checkbox)
         checkbox_layout.addWidget(self.hue_checkbox)
         checkbox_layout.addStretch(1)
-        root_layout.addLayout(checkbox_layout)
+        controls_layout.addLayout(checkbox_layout)
+        controls_layout.addStretch(1)
+
+        previews_widget = QtWidgets.QWidget()
+        previews_layout = QtWidgets.QHBoxLayout(previews_widget)
+        previews_layout.setContentsMargins(0, 0, 0, 0)
+        previews_layout.setSpacing(12)
+        content_layout.addWidget(previews_widget, 1)
+
+        image_preview_group = QtWidgets.QGroupBox("Target Image Preview")
+        image_preview_layout = QtWidgets.QVBoxLayout(image_preview_group)
+        self.image_preview_label = ImagePreviewLabel("Target Image Preview")
+        self.image_preview_label.setMinimumSize(320, 320)
+        self.image_preview_info_label = QtWidgets.QLabel("Choose a target image to preview it.")
+        self.image_preview_info_label.setWordWrap(True)
+        image_preview_layout.addWidget(self.image_preview_label, 1)
+        image_preview_layout.addWidget(self.image_preview_info_label)
+        previews_layout.addWidget(image_preview_group, 1)
+
+        mask_preview_group = QtWidgets.QGroupBox("Mask Preview")
+        mask_preview_layout = QtWidgets.QVBoxLayout(mask_preview_group)
+        self.mask_preview_label = ImagePreviewLabel("Mask Preview")
+        self.mask_preview_label.setMinimumSize(320, 320)
+        self.mask_preview_info_label = QtWidgets.QLabel("Choose a mask source to preview it.")
+        self.mask_preview_info_label.setWordWrap(True)
+        mask_preview_layout.addWidget(self.mask_preview_label, 1)
+        mask_preview_layout.addWidget(self.mask_preview_info_label)
+        previews_layout.addWidget(mask_preview_group, 1)
 
         self.button_box = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.StandardButton.Ok | QtWidgets.QDialogButtonBox.StandardButton.Cancel
@@ -190,8 +258,217 @@ class QtTargetImagePickerDialog(QtWidgets.QDialog):
         root_layout.addWidget(self.button_box)
 
         self.browse_button.clicked.connect(self._browse_image)
+        self.mask_browse_button.clicked.connect(self._browse_mask)
+        self.mask_clear_button.clicked.connect(self._clear_mask)
         self.button_box.accepted.connect(self.accept)
         self.button_box.rejected.connect(self.reject)
+        self.image_path_edit.textChanged.connect(self._on_image_path_changed)
+        self.mask_path_edit.textChanged.connect(self._refresh_mask_preview)
+        self.use_image_alpha_radio.toggled.connect(self._on_mask_mode_changed)
+        self.load_mask_radio.toggled.connect(self._on_mask_mode_changed)
+        self.pick_region_radio.toggled.connect(self._on_mask_mode_changed)
+        self.image_preview_label.image_point_clicked.connect(self._handle_image_preview_click)
+
+        self._set_initial_mask_mode(initial_mask_mode)
+        self._sync_mask_controls()
+        self._refresh_previews()
+
+    def _set_initial_mask_mode(self, initial_mask_mode: str | None):
+        mask_mode = initial_mask_mode or ("external" if self.mask_path_edit.text().strip() else "image-alpha")
+        if mask_mode == "external":
+            self.load_mask_radio.setChecked(True)
+        elif mask_mode == "interactive-seed":
+            self.pick_region_radio.setChecked(True)
+        else:
+            self.use_image_alpha_radio.setChecked(True)
+
+    def _mask_mode(self) -> str:
+        if self.load_mask_radio.isChecked():
+            return "external"
+        if self.pick_region_radio.isChecked():
+            return "interactive-seed"
+        return "image-alpha"
+
+    def _sync_mask_controls(self):
+        mask_controls_enabled = self.load_mask_radio.isChecked()
+        self.mask_path_edit.setEnabled(mask_controls_enabled)
+        self.mask_browse_button.setEnabled(mask_controls_enabled)
+        self.mask_clear_button.setEnabled(mask_controls_enabled)
+        self.image_preview_label.set_click_enabled(self._mask_mode() == "interactive-seed")
+
+    def _on_image_path_changed(self):
+        self._mask_seed_point = None
+        self._refresh_previews()
+
+    def _on_mask_mode_changed(self):
+        self._sync_mask_controls()
+        self._refresh_previews()
+
+    def _handle_image_preview_click(self, row: int, column: int):
+        if self._mask_mode() != "interactive-seed":
+            return
+        self._mask_seed_point = (int(row), int(column))
+        self._refresh_previews()
+
+    def _clear_mask(self):
+        self.mask_path_edit.clear()
+        self.use_image_alpha_radio.setChecked(True)
+
+    def _refresh_previews(self):
+        self._refresh_image_preview()
+        self._refresh_mask_preview()
+
+    def _refresh_image_preview(self):
+        image_path = self.selected_image_path()
+        if not image_path:
+            _set_preview_panel_state(
+                self.image_preview_label,
+                self.image_preview_info_label,
+                preview_rgb=None,
+                placeholder_text="Target Image Preview",
+                info_text="Choose a target image to preview it.",
+            )
+            return
+        try:
+            preview_rgb, image_shape = _load_image_preview_uint8(image_path)
+        except Exception as exc:  # noqa: BLE001
+            _set_preview_panel_state(
+                self.image_preview_label,
+                self.image_preview_info_label,
+                preview_rgb=None,
+                placeholder_text="Target Image Preview",
+                info_text=f"Failed to preview image: {exc}",
+                info_style="color: #ff9b9b;",
+            )
+            return
+        if self._mask_mode() == "interactive-seed":
+            summary = "Click one pixel to remove its connected region from the mask preview."
+            if self._mask_seed_point is not None:
+                summary = (
+                    "Click one pixel to remove its connected region from the mask preview. "
+                    f"Selected seed: x={self._mask_seed_point[1]}, y={self._mask_seed_point[0]}."
+                )
+        else:
+            summary = "Previewing the selected target image."
+        _set_preview_panel_state(
+            self.image_preview_label,
+            self.image_preview_info_label,
+            preview_rgb=preview_rgb,
+            placeholder_text="Target Image Preview",
+            info_text=_format_image_preview_info(image_shape, summary=summary),
+            source_image_shape=image_shape,
+        )
+
+    def _refresh_mask_preview(self):
+        image_path = self.selected_image_path()
+        expected_shape = _load_optional_image_shape(image_path)
+        mask_mode = self._mask_mode()
+        if mask_mode == "external":
+            mask_path = self.mask_path_edit.text().strip()
+            if not mask_path:
+                _set_preview_panel_state(
+                    self.mask_preview_label,
+                    self.mask_preview_info_label,
+                    preview_rgb=None,
+                    placeholder_text="Mask Preview",
+                    info_text="Choose a mask file to preview it.",
+                )
+                return
+            try:
+                preview_rgb, mask_shape, valid_pixels = _load_mask_preview_uint8(mask_path)
+                info_text, info_style = _format_mask_preview_info(
+                    mask_shape,
+                    valid_pixels,
+                    summary="Previewing the selected external mask.",
+                    expected_shape=expected_shape,
+                )
+            except Exception as exc:  # noqa: BLE001
+                _set_preview_panel_state(
+                    self.mask_preview_label,
+                    self.mask_preview_info_label,
+                    preview_rgb=None,
+                    placeholder_text="Mask Preview",
+                    info_text=f"Failed to preview mask: {exc}",
+                    info_style="color: #ff9b9b;",
+                )
+                return
+        elif mask_mode == "interactive-seed":
+            if not image_path:
+                _set_preview_panel_state(
+                    self.mask_preview_label,
+                    self.mask_preview_info_label,
+                    preview_rgb=None,
+                    placeholder_text="Mask Preview",
+                    info_text="Choose a target image, then click one pixel in the image preview.",
+                )
+                return
+            if self._mask_seed_point is None:
+                _set_preview_panel_state(
+                    self.mask_preview_label,
+                    self.mask_preview_info_label,
+                    preview_rgb=None,
+                    placeholder_text="Mask Preview",
+                    info_text="Click one pixel in the target image preview to build a connected-region mask.",
+                )
+                return
+            try:
+                preview_rgb, mask_shape, valid_pixels, summary = _load_seeded_mask_preview_uint8(
+                    image_path,
+                    self._mask_seed_point,
+                )
+                info_text, info_style = _format_mask_preview_info(
+                    mask_shape,
+                    valid_pixels,
+                    summary=summary,
+                    expected_shape=expected_shape,
+                )
+            except Exception as exc:  # noqa: BLE001
+                _set_preview_panel_state(
+                    self.mask_preview_label,
+                    self.mask_preview_info_label,
+                    preview_rgb=None,
+                    placeholder_text="Mask Preview",
+                    info_text=f"Connected-region preview failed: {exc}",
+                    info_style="color: #ff9b9b;",
+                )
+                return
+        else:
+            if not image_path:
+                _set_preview_panel_state(
+                    self.mask_preview_label,
+                    self.mask_preview_info_label,
+                    preview_rgb=None,
+                    placeholder_text="Mask Preview",
+                    info_text="Choose a target image to preview its embedded or implicit mask.",
+                )
+                return
+            try:
+                preview_rgb, mask_shape, valid_pixels, summary = _load_embedded_or_implicit_mask_preview_uint8(image_path)
+                info_text, info_style = _format_mask_preview_info(
+                    mask_shape,
+                    valid_pixels,
+                    summary=summary,
+                    expected_shape=expected_shape,
+                )
+            except Exception as exc:  # noqa: BLE001
+                _set_preview_panel_state(
+                    self.mask_preview_label,
+                    self.mask_preview_info_label,
+                    preview_rgb=None,
+                    placeholder_text="Mask Preview",
+                    info_text=f"Failed to preview mask source: {exc}",
+                    info_style="color: #ff9b9b;",
+                )
+                return
+
+        _set_preview_panel_state(
+            self.mask_preview_label,
+            self.mask_preview_info_label,
+            preview_rgb=preview_rgb,
+            placeholder_text="Mask Preview",
+            info_text=info_text,
+            info_style=info_style,
+        )
 
     def _browse_image(self):
         selected_path, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -203,9 +480,31 @@ class QtTargetImagePickerDialog(QtWidgets.QDialog):
         if selected_path:
             self.image_path_edit.setText(selected_path)
 
+    def _browse_mask(self):
+        selected_path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Select target mask image",
+            os.path.dirname(self.mask_path_edit.text().strip() or self.image_path_edit.text().strip() or os.getcwd()),
+            "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.webp)",
+        )
+        if selected_path:
+            self.load_mask_radio.setChecked(True)
+            self.mask_path_edit.setText(selected_path)
+
     def selected_image_path(self) -> str | None:
         value = self.image_path_edit.text().strip()
         return value or None
+
+    def selected_mask_path(self) -> str | None:
+        if not self.load_mask_radio.isChecked():
+            return None
+        value = self.mask_path_edit.text().strip()
+        return value or None
+
+    def selected_mask_seed_point(self) -> tuple[int, int] | None:
+        if self._mask_mode() != "interactive-seed":
+            return None
+        return self._mask_seed_point
 
     def selected_curve_flags(self) -> tuple[bool, bool, bool]:
         return (
@@ -216,10 +515,31 @@ class QtTargetImagePickerDialog(QtWidgets.QDialog):
 
     def accept(self):
         image_path = self.selected_image_path()
+        mask_path = self.selected_mask_path()
         apply_lightness, apply_chroma, apply_hue = self.selected_curve_flags()
         if image_path is None:
             QtWidgets.QMessageBox.critical(self, "Target Image Required", "Please choose a target image first.")
             return
+        if self.load_mask_radio.isChecked() and mask_path is None:
+            QtWidgets.QMessageBox.critical(self, "Target Mask Required", "Please choose a target mask first.")
+            return
+        if self._mask_mode() == "interactive-seed" and self._mask_seed_point is None:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Seed Pixel Required",
+                "Please click one pixel in the target image preview first.",
+            )
+            return
+        if mask_path is not None:
+            image_shape = _load_optional_image_shape(image_path)
+            mask_shape = _load_optional_image_shape(mask_path)
+            if image_shape is not None and mask_shape is not None and tuple(image_shape) != tuple(mask_shape):
+                QtWidgets.QMessageBox.critical(
+                    self,
+                    "Target Mask Size Mismatch",
+                    "Target mask size must match the selected target image.",
+                )
+                return
         if not any((apply_lightness, apply_chroma, apply_hue)):
             QtWidgets.QMessageBox.critical(self, "Target Curves Required", "Select at least one of L, C, or H.")
             return
@@ -229,23 +549,54 @@ class QtTargetImagePickerDialog(QtWidgets.QDialog):
 class ImagePreviewLabel(QtWidgets.QLabel):
     """QLabel that keeps an RGB preview scaled to the available size."""
 
+    image_point_clicked = QtCore.Signal(int, int)
+
     def __init__(self, title: str):
         super().__init__()
         self._title = title
         self._pixmap: QtGui.QPixmap | None = None
+        self._preview_shape: tuple[int, int] | None = None
+        self._source_shape: tuple[int, int] | None = None
+        self._click_enabled = False
         self.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         self.setMinimumSize(320, 320)
         self.setStyleSheet("background-color: #111; border: 1px solid #333;")
         self.setText(title)
 
-    def set_rgb_uint8(self, rgb_uint8: np.ndarray):
+    def set_rgb_uint8(self, rgb_uint8: np.ndarray, *, source_image_shape: tuple[int, int] | None = None):
         """Update the displayed RGB image."""
         self._pixmap = QtGui.QPixmap.fromImage(_rgb_uint8_to_qimage(rgb_uint8))
+        self._preview_shape = tuple(int(value) for value in rgb_uint8.shape[:2])
+        self._source_shape = source_image_shape or self._preview_shape
         self._refresh_pixmap()
+        self._refresh_cursor()
+
+    def clear_preview(self, text: str | None = None):
+        """Reset the preview back to a text placeholder."""
+        self._pixmap = None
+        self._preview_shape = None
+        self._source_shape = None
+        self.clear()
+        self.setText(text or self._title)
+        self._refresh_cursor()
+
+    def set_click_enabled(self, enabled: bool):
+        """Enable or disable image-coordinate click reporting."""
+        self._click_enabled = bool(enabled)
+        self._refresh_cursor()
 
     def resizeEvent(self, event: QtGui.QResizeEvent):
         super().resizeEvent(event)
         self._refresh_pixmap()
+
+    def mousePressEvent(self, event: QtGui.QMouseEvent):
+        super().mousePressEvent(event)
+        if event.button() != QtCore.Qt.MouseButton.LeftButton:
+            return
+        image_point = self._map_event_to_image_point(event.position())
+        if image_point is None:
+            return
+        self.image_point_clicked.emit(image_point[0], image_point[1])
 
     def _refresh_pixmap(self):
         if self._pixmap is None:
@@ -256,6 +607,426 @@ class ImagePreviewLabel(QtWidgets.QLabel):
             QtCore.Qt.TransformationMode.SmoothTransformation,
         )
         self.setPixmap(scaled)
+
+    def _refresh_cursor(self):
+        if self._click_enabled and self._pixmap is not None:
+            self.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+            return
+        self.setCursor(QtCore.Qt.CursorShape.ArrowCursor)
+
+    def _map_event_to_image_point(self, position: QtCore.QPointF) -> tuple[int, int] | None:
+        if not self._click_enabled or self._pixmap is None or self._preview_shape is None or self._source_shape is None:
+            return None
+        scaled = self._pixmap.scaled(
+            self.size(),
+            QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+            QtCore.Qt.TransformationMode.SmoothTransformation,
+        )
+        x_offset = (self.width() - scaled.width()) / 2.0
+        y_offset = (self.height() - scaled.height()) / 2.0
+        x_value = float(position.x()) - x_offset
+        y_value = float(position.y()) - y_offset
+        if x_value < 0.0 or y_value < 0.0 or x_value >= float(scaled.width()) or y_value >= float(scaled.height()):
+            return None
+        preview_height, preview_width = self._preview_shape
+        source_height, source_width = self._source_shape
+        preview_column = min(preview_width - 1, int(x_value * preview_width / max(1, scaled.width())))
+        preview_row = min(preview_height - 1, int(y_value * preview_height / max(1, scaled.height())))
+        source_column = min(source_width - 1, int(preview_column * source_width / max(1, preview_width)))
+        source_row = min(source_height - 1, int(preview_row * source_height / max(1, preview_height)))
+        return source_row, source_column
+
+
+def _load_optional_image_shape(image_path: str | None) -> tuple[int, int] | None:
+    """Return the image shape as (height, width) when the file exists and is readable."""
+    if not image_path:
+        return None
+    try:
+        with Image.open(image_path) as image:
+            width, height = image.size
+    except Exception:  # noqa: BLE001
+        return None
+    return height, width
+
+
+def _load_image_preview_uint8(image_path: str, *, max_side: int = 640) -> tuple[np.ndarray, tuple[int, int]]:
+    """Load an image file and return a small RGB preview plus its original shape."""
+    with Image.open(image_path) as image:
+        rgb_image = image.convert("RGB")
+        width, height = rgb_image.size
+        preview_image = rgb_image.copy()
+        preview_image.thumbnail((int(max_side), int(max_side)), PIL_PREVIEW_RESAMPLE)
+    return np.asarray(preview_image, dtype=np.uint8), (height, width)
+
+
+def _mask_to_preview_uint8(valid_mask: np.ndarray) -> tuple[np.ndarray, tuple[int, int], int]:
+    """Convert a boolean valid-mask into a black/white RGB preview image."""
+    valid_mask = np.asarray(valid_mask, dtype=bool)
+    preview_gray = np.where(valid_mask, 255, 0).astype(np.uint8)
+    preview_rgb = np.repeat(preview_gray[:, :, None], 3, axis=2)
+    return preview_rgb, tuple(int(value) for value in valid_mask.shape), int(np.count_nonzero(valid_mask))
+
+
+def _load_mask_preview_uint8(mask_path: str) -> tuple[np.ndarray, tuple[int, int], int]:
+    """Load a mask file and convert it into a black/white RGB preview."""
+    with Image.open(mask_path) as image:
+        mask_array = np.asarray(image.convert("L"), dtype=np.uint8)
+    valid_mask = np.asarray(mask_array > 0, dtype=bool)
+    return _mask_to_preview_uint8(valid_mask)
+
+
+def _load_embedded_or_implicit_mask_preview_uint8(
+    image_path: str,
+) -> tuple[np.ndarray, tuple[int, int], int, str]:
+    """Load the input image's embedded alpha preview, or a full-image fallback when no alpha exists."""
+    with Image.open(image_path) as image:
+        width, height = image.size
+        if "A" in image.getbands():
+            alpha_plane = np.asarray(image.getchannel("A"), dtype=np.uint8)
+            preview_rgb, mask_shape, valid_pixels = _mask_to_preview_uint8(alpha_plane > 0)
+            if np.all(alpha_plane == 255):
+                return preview_rgb, mask_shape, valid_pixels, "Embedded alpha is fully opaque."
+            return preview_rgb, mask_shape, valid_pixels, "Previewing embedded alpha coverage."
+    implicit_mask = np.ones((height, width), dtype=bool)
+    preview_rgb, mask_shape, valid_pixels = _mask_to_preview_uint8(implicit_mask)
+    return preview_rgb, mask_shape, valid_pixels, "No embedded alpha; previewing full-image coverage."
+
+
+def _load_seeded_mask_preview_uint8(
+    image_path: str,
+    seed_point: tuple[int, int],
+) -> tuple[np.ndarray, tuple[int, int], int, str]:
+    """Generate a preview for a connected-region mask grown from a user-selected seed pixel."""
+    with Image.open(image_path) as image:
+        rgb_float = np.asarray(image.convert("RGB"), dtype=np.float64) / 255.0
+    valid_mask = detect_seeded_valid_mask(rgb_float, seed_point)
+    preview_rgb, mask_shape, valid_pixels = _mask_to_preview_uint8(valid_mask)
+    return (
+        preview_rgb,
+        mask_shape,
+        valid_pixels,
+        "Previewing the connected-region mask from the selected seed pixel.",
+    )
+
+
+def _set_preview_panel_state(
+    preview_label: ImagePreviewLabel,
+    info_label: QtWidgets.QLabel,
+    *,
+    preview_rgb: np.ndarray | None,
+    placeholder_text: str,
+    info_text: str,
+    info_style: str = "color: #cccccc;",
+    source_image_shape: tuple[int, int] | None = None,
+):
+    """Update a preview label plus its companion info label."""
+    if preview_rgb is None:
+        preview_label.clear_preview(placeholder_text)
+    else:
+        preview_label.set_rgb_uint8(preview_rgb, source_image_shape=source_image_shape)
+    info_label.setText(info_text)
+    info_label.setStyleSheet(info_style)
+
+
+def _format_image_preview_info(image_shape: tuple[int, int], *, summary: str | None = None) -> str:
+    """Build a compact info string for an RGB image preview."""
+    info_lines = []
+    if summary:
+        info_lines.append(summary)
+    info_lines.append("Shape: {} x {}".format(image_shape[1], image_shape[0]))
+    return "\n".join(info_lines)
+
+
+def _format_mask_preview_info(
+    mask_shape: tuple[int, int],
+    valid_pixels: int,
+    *,
+    summary: str,
+    expected_shape: tuple[int, int] | None = None,
+) -> tuple[str, str]:
+    """Build a compact info string plus style for a mask preview panel."""
+    total_pixels = max(1, int(mask_shape[0] * mask_shape[1]))
+    coverage = 100.0 * float(valid_pixels) / float(total_pixels)
+    info_lines = [
+        summary,
+        "Shape: {} x {}".format(mask_shape[1], mask_shape[0]),
+        "Valid pixels: {} / {} ({:.1f}%)".format(valid_pixels, total_pixels, coverage),
+    ]
+    info_style = "color: #cccccc;"
+    if expected_shape is not None:
+        if tuple(expected_shape) == tuple(mask_shape):
+            info_lines.append("Matches selected image size.")
+            info_style = "color: #8fe388;"
+        else:
+            info_lines.append(
+                "Does not match selected image size: expected {} x {}.".format(
+                    expected_shape[1],
+                    expected_shape[0],
+                )
+            )
+            info_style = "color: #ff9b9b;"
+    return "\n".join(info_lines), info_style
+
+
+class QtMaskPreviewDialog(QtWidgets.QDialog):
+    """Modal dialog that previews the binary shape of a selected mask."""
+
+    def __init__(
+        self,
+        parent: QtWidgets.QWidget | None,
+        mask_path: str,
+        *,
+        expected_shape: tuple[int, int] | None = None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("Mask Preview")
+        self.resize(520, 620)
+
+        preview_rgb, mask_shape, valid_pixels = _load_mask_preview_uint8(mask_path)
+        total_pixels = max(1, mask_shape[0] * mask_shape[1])
+        coverage = 100.0 * valid_pixels / total_pixels
+
+        root_layout = QtWidgets.QVBoxLayout(self)
+        root_layout.setContentsMargins(18, 18, 18, 18)
+        root_layout.setSpacing(12)
+
+        path_label = QtWidgets.QLabel(mask_path)
+        path_label.setWordWrap(True)
+        root_layout.addWidget(path_label)
+
+        self.preview_label = ImagePreviewLabel("Mask Preview")
+        self.preview_label.setMinimumSize(420, 420)
+        self.preview_label.set_rgb_uint8(preview_rgb)
+        root_layout.addWidget(self.preview_label, 1)
+
+        self.shape_label = QtWidgets.QLabel(
+            "Shape: {} x {}    Valid pixels: {} / {} ({:.1f}%)".format(
+                mask_shape[1],
+                mask_shape[0],
+                valid_pixels,
+                total_pixels,
+                coverage,
+            )
+        )
+        root_layout.addWidget(self.shape_label)
+
+        if expected_shape is None:
+            comparison_text = "No reference image selected yet; size check will happen when the image is loaded."
+            comparison_style = "color: #cccccc;"
+        elif tuple(expected_shape) == tuple(mask_shape):
+            comparison_text = "Mask shape matches the selected image."
+            comparison_style = "color: #8fe388;"
+        else:
+            comparison_text = "Mask shape does not match the selected image: expected {} x {}, got {} x {}.".format(
+                expected_shape[1],
+                expected_shape[0],
+                mask_shape[1],
+                mask_shape[0],
+            )
+            comparison_style = "color: #ff9b9b;"
+        self.comparison_label = QtWidgets.QLabel(comparison_text)
+        self.comparison_label.setWordWrap(True)
+        self.comparison_label.setStyleSheet(comparison_style)
+        root_layout.addWidget(self.comparison_label)
+
+        self.button_box = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok | QtWidgets.QDialogButtonBox.StandardButton.Cancel
+        )
+        self.button_box.accepted.connect(self.accept)
+        self.button_box.rejected.connect(self.reject)
+        root_layout.addWidget(self.button_box)
+
+
+def _select_mask_path_with_preview(
+    parent: QtWidgets.QWidget | None,
+    *,
+    title: str,
+    initial_directory: str,
+    expected_shape: tuple[int, int] | None = None,
+) -> str | None:
+    """Let the user choose a mask file, then confirm it from a binary-shape preview dialog."""
+    selected_path, _ = QtWidgets.QFileDialog.getOpenFileName(
+        parent,
+        title,
+        initial_directory,
+        "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.webp)",
+    )
+    if not selected_path:
+        return None
+    preview_dialog = QtMaskPreviewDialog(parent, selected_path, expected_shape=expected_shape)
+    if preview_dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+        return None
+    return selected_path
+
+
+class QtSeedMaskSelectionDialog(QtWidgets.QDialog):
+    """Modal dialog that lets the user click one seed pixel and preview its connected-region mask."""
+
+    def __init__(
+        self,
+        parent: QtWidgets.QWidget | None,
+        image_path: str,
+        *,
+        image_warnings: tuple[str, ...] = (),
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("Select Mask Seed")
+        self.resize(980, 720)
+        self._image_path = image_path
+        self._mask_seed_point: tuple[int, int] | None = None
+        self._continue_without_mask = False
+
+        root_layout = QtWidgets.QVBoxLayout(self)
+        root_layout.setContentsMargins(18, 18, 18, 18)
+        root_layout.setSpacing(12)
+
+        instructions = list(image_warnings)
+        instructions.append("Click one pixel in the image preview. The connected region grown from that pixel will be masked out.")
+        instructions.append("Use 'Continue Without Extra Mask' if you want to keep the whole image valid.")
+        description_label = QtWidgets.QLabel("\n\n".join(instructions))
+        description_label.setWordWrap(True)
+        root_layout.addWidget(description_label)
+
+        previews_layout = QtWidgets.QHBoxLayout()
+        previews_layout.setSpacing(12)
+        root_layout.addLayout(previews_layout, 1)
+
+        image_group = QtWidgets.QGroupBox("Input Image Preview")
+        image_layout = QtWidgets.QVBoxLayout(image_group)
+        self.image_preview_label = ImagePreviewLabel("Input Image Preview")
+        self.image_preview_label.setMinimumSize(360, 360)
+        self.image_preview_label.set_click_enabled(True)
+        self.image_preview_info_label = QtWidgets.QLabel("Loading input image preview...")
+        self.image_preview_info_label.setWordWrap(True)
+        image_layout.addWidget(self.image_preview_label, 1)
+        image_layout.addWidget(self.image_preview_info_label)
+        previews_layout.addWidget(image_group, 1)
+
+        mask_group = QtWidgets.QGroupBox("Mask Preview")
+        mask_layout = QtWidgets.QVBoxLayout(mask_group)
+        self.mask_preview_label = ImagePreviewLabel("Mask Preview")
+        self.mask_preview_label.setMinimumSize(360, 360)
+        self.mask_preview_info_label = QtWidgets.QLabel("Click one pixel in the image preview to build a connected-region mask.")
+        self.mask_preview_info_label.setWordWrap(True)
+        mask_layout.addWidget(self.mask_preview_label, 1)
+        mask_layout.addWidget(self.mask_preview_info_label)
+        previews_layout.addWidget(mask_group, 1)
+
+        self.button_box = QtWidgets.QDialogButtonBox()
+        self.use_seed_button = self.button_box.addButton(
+            "Use Selected Region",
+            QtWidgets.QDialogButtonBox.ButtonRole.AcceptRole,
+        )
+        self.continue_button = self.button_box.addButton(
+            "Continue Without Extra Mask",
+            QtWidgets.QDialogButtonBox.ButtonRole.ActionRole,
+        )
+        self.cancel_button = self.button_box.addButton(QtWidgets.QDialogButtonBox.StandardButton.Cancel)
+        root_layout.addWidget(self.button_box)
+
+        self.use_seed_button.clicked.connect(self.accept)
+        self.continue_button.clicked.connect(self._continue_without_mask_clicked)
+        self.cancel_button.clicked.connect(self.reject)
+        self.image_preview_label.image_point_clicked.connect(self._handle_image_preview_click)
+
+        self._refresh_previews()
+
+    def selected_mask_seed_point(self) -> tuple[int, int] | None:
+        return self._mask_seed_point
+
+    def continue_without_mask_requested(self) -> bool:
+        return self._continue_without_mask
+
+    def accept(self):
+        if self._continue_without_mask:
+            super().accept()
+            return
+        if self._mask_seed_point is None:
+            QtWidgets.QMessageBox.critical(self, "Seed Pixel Required", "Please click one pixel in the image preview first.")
+            return
+        super().accept()
+
+    def _continue_without_mask_clicked(self):
+        self._continue_without_mask = True
+        super().accept()
+
+    def _handle_image_preview_click(self, row: int, column: int):
+        self._continue_without_mask = False
+        self._mask_seed_point = (int(row), int(column))
+        self._refresh_previews()
+
+    def _refresh_previews(self):
+        self._refresh_image_preview()
+        self._refresh_mask_preview()
+
+    def _refresh_image_preview(self):
+        try:
+            preview_rgb, image_shape = _load_image_preview_uint8(self._image_path)
+        except Exception as exc:  # noqa: BLE001
+            _set_preview_panel_state(
+                self.image_preview_label,
+                self.image_preview_info_label,
+                preview_rgb=None,
+                placeholder_text="Input Image Preview",
+                info_text=f"Failed to preview input image: {exc}",
+                info_style="color: #ff9b9b;",
+            )
+            return
+        summary = "Click one pixel to remove its connected region from the mask."
+        if self._mask_seed_point is not None:
+            summary = (
+                "Click one pixel to remove its connected region from the mask. "
+                f"Selected seed: x={self._mask_seed_point[1]}, y={self._mask_seed_point[0]}."
+            )
+        _set_preview_panel_state(
+            self.image_preview_label,
+            self.image_preview_info_label,
+            preview_rgb=preview_rgb,
+            placeholder_text="Input Image Preview",
+            info_text=_format_image_preview_info(image_shape, summary=summary),
+            source_image_shape=image_shape,
+        )
+
+    def _refresh_mask_preview(self):
+        expected_shape = _load_optional_image_shape(self._image_path)
+        if self._mask_seed_point is None:
+            _set_preview_panel_state(
+                self.mask_preview_label,
+                self.mask_preview_info_label,
+                preview_rgb=None,
+                placeholder_text="Mask Preview",
+                info_text="Click one pixel in the image preview to build a connected-region mask.",
+            )
+            return
+        try:
+            preview_rgb, mask_shape, valid_pixels, summary = _load_seeded_mask_preview_uint8(
+                self._image_path,
+                self._mask_seed_point,
+            )
+            info_text, info_style = _format_mask_preview_info(
+                mask_shape,
+                valid_pixels,
+                summary=summary,
+                expected_shape=expected_shape,
+            )
+        except Exception as exc:  # noqa: BLE001
+            _set_preview_panel_state(
+                self.mask_preview_label,
+                self.mask_preview_info_label,
+                preview_rgb=None,
+                placeholder_text="Mask Preview",
+                info_text=f"Connected-region preview failed: {exc}",
+                info_style="color: #ff9b9b;",
+            )
+            return
+        _set_preview_panel_state(
+            self.mask_preview_label,
+            self.mask_preview_info_label,
+            preview_rgb=preview_rgb,
+            placeholder_text="Mask Preview",
+            info_text=info_text,
+            info_style=info_style,
+        )
 
 
 class DraggableCurveGraph(pg.GraphItem):
@@ -470,8 +1241,11 @@ class QtOklchCurveEditorWindow(QtWidgets.QMainWindow):
         self.curve_output_path = curve_output_path or self._default_curve_output_path()
         self.source_lightness_samples = self.oklch_float[self.valid_mask, 0]
         self.target_curve_image_paths: dict[str, str] = {}
+        self.target_curve_mask_paths: dict[str, str | None] = {}
         self._lightness_reference_histogram: tuple[np.ndarray, np.ndarray] | None = None
         self._last_target_image_dialog_path = self.image_path
+        self._last_target_mask_dialog_path: str | None = None
+        self._last_target_mask_mode = "image-alpha"
 
         self._build_preview_inputs()
         self._initialize_controls(initial_curve_overrides or {})
@@ -679,11 +1453,16 @@ class QtOklchCurveEditorWindow(QtWidgets.QMainWindow):
         self,
         image_path: str,
         *,
-        auto_detect_mask: bool = False,
+        alpha_mask_path: str | None = None,
+        mask_seed_point: tuple[int, int] | None = None,
         show_warnings: bool = True,
     ) -> tuple[LoadedImageData, OklchCurveModel, np.ndarray]:
         """Load a target image and build its Oklch curve model."""
-        loaded_image = load_image_data(image_path, auto_detect_mask=auto_detect_mask)
+        loaded_image = load_image_data(
+            image_path,
+            alpha_mask_path=alpha_mask_path,
+            mask_seed_point=mask_seed_point,
+        )
         if show_warnings:
             self._show_image_warnings("Target Image Warning", loaded_image.image_warnings)
         target_model, _ = build_oklch_curve_model(loaded_image.oklch_float, loaded_image.valid_mask)
@@ -705,10 +1484,11 @@ class QtOklchCurveEditorWindow(QtWidgets.QMainWindow):
         self,
         image_path: str,
         *,
+        alpha_mask_path: str | None = None,
+        mask_seed_point: tuple[int, int] | None = None,
         apply_lightness: bool,
         apply_chroma: bool,
         apply_hue: bool,
-        auto_detect_mask: bool = False,
         show_warnings: bool = True,
     ):
         """Load one target image and apply it to the selected L/C/H curves."""
@@ -717,10 +1497,18 @@ class QtOklchCurveEditorWindow(QtWidgets.QMainWindow):
 
         loaded_image, target_model, target_lightness_samples = self._load_target_curve_model(
             image_path,
-            auto_detect_mask=auto_detect_mask,
+            alpha_mask_path=alpha_mask_path,
+            mask_seed_point=mask_seed_point,
             show_warnings=show_warnings,
         )
         self._last_target_image_dialog_path = loaded_image.image_path
+        self._last_target_mask_dialog_path = loaded_image.alpha_mask_path
+        if loaded_image.alpha_source == "external-mask":
+            self._last_target_mask_mode = "external"
+        elif loaded_image.alpha_source == "interactive-seed":
+            self._last_target_mask_mode = "interactive-seed"
+        else:
+            self._last_target_mask_mode = "image-alpha"
 
         applied_labels: list[str] = []
         if apply_lightness:
@@ -729,6 +1517,7 @@ class QtOklchCurveEditorWindow(QtWidgets.QMainWindow):
                 target_lightness_samples,
             )
             self.target_curve_image_paths["lightness"] = loaded_image.image_path
+            self.target_curve_mask_paths["lightness"] = loaded_image.alpha_mask_path
             self._lightness_reference_histogram = self._build_lightness_histogram(target_lightness_samples)
             self._apply_control_points(0, lightness_points, rerender=False)
             applied_labels.append("L")
@@ -741,6 +1530,7 @@ class QtOklchCurveEditorWindow(QtWidgets.QMainWindow):
                 clip_min=0.0,
             )
             self.target_curve_image_paths["chroma"] = loaded_image.image_path
+            self.target_curve_mask_paths["chroma"] = loaded_image.alpha_mask_path
             self._apply_control_points(1, chroma_points, rerender=False)
             applied_labels.append("C")
 
@@ -752,6 +1542,7 @@ class QtOklchCurveEditorWindow(QtWidgets.QMainWindow):
                 wrap_degrees=True,
             )
             self.target_curve_image_paths["hue"] = loaded_image.image_path
+            self.target_curve_mask_paths["hue"] = loaded_image.alpha_mask_path
             self._apply_control_points(2, hue_points, rerender=False)
             applied_labels.append("H")
 
@@ -760,28 +1551,31 @@ class QtOklchCurveEditorWindow(QtWidgets.QMainWindow):
             "Loaded target image for {}: {}".format("/".join(applied_labels), loaded_image.image_path)
         )
 
-    def apply_lightness_target_image(self, image_path: str):
+    def apply_lightness_target_image(self, image_path: str, *, alpha_mask_path: str | None = None):
         """Load a target image for Lt(y) and fit a monotonic lightness transfer curve."""
         self.apply_target_image_selection(
             image_path,
+            alpha_mask_path=alpha_mask_path,
             apply_lightness=True,
             apply_chroma=False,
             apply_hue=False,
         )
 
-    def apply_chroma_target_image(self, image_path: str):
+    def apply_chroma_target_image(self, image_path: str, *, alpha_mask_path: str | None = None):
         """Load a target image and copy its chroma curve into Ct(L')."""
         self.apply_target_image_selection(
             image_path,
+            alpha_mask_path=alpha_mask_path,
             apply_lightness=False,
             apply_chroma=True,
             apply_hue=False,
         )
 
-    def apply_hue_target_image(self, image_path: str):
+    def apply_hue_target_image(self, image_path: str, *, alpha_mask_path: str | None = None):
         """Load a target image and copy its hue curve into ht(L')."""
         self.apply_target_image_selection(
             image_path,
+            alpha_mask_path=alpha_mask_path,
             apply_lightness=False,
             apply_chroma=False,
             apply_hue=True,
@@ -789,32 +1583,30 @@ class QtOklchCurveEditorWindow(QtWidgets.QMainWindow):
 
     def _open_target_image_picker(self):
         """Choose one target image and optionally apply it to L/C/H together."""
-        dialog = QtTargetImagePickerDialog(self, initial_image_path=self._last_target_image_dialog_path)
+        dialog = QtTargetImagePickerDialog(
+            self,
+            initial_image_path=self._last_target_image_dialog_path,
+            initial_mask_path=self._last_target_mask_dialog_path,
+            initial_mask_mode=self._last_target_mask_mode,
+        )
         if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
             return
 
         selected_path = dialog.selected_image_path()
+        selected_mask_path = dialog.selected_mask_path()
+        mask_seed_point = dialog.selected_mask_seed_point()
         apply_lightness, apply_chroma, apply_hue = dialog.selected_curve_flags()
         if selected_path is None:
-            return
-
-        _, auto_detect_mask, prompt_was_shown, cancelled = _resolve_qt_mask_loading(
-            self,
-            selected_path,
-            None,
-            prompt_user=True,
-        )
-        if cancelled:
-            self.status_label.setText("Target image loading cancelled.")
             return
         try:
             self.apply_target_image_selection(
                 selected_path,
+                alpha_mask_path=selected_mask_path,
+                mask_seed_point=mask_seed_point,
                 apply_lightness=apply_lightness,
                 apply_chroma=apply_chroma,
                 apply_hue=apply_hue,
-                auto_detect_mask=auto_detect_mask,
-                show_warnings=not prompt_was_shown,
+                show_warnings=True,
             )
         except Exception as exc:  # noqa: BLE001
             self._show_error("Load Target Image Failed", str(exc))
@@ -964,16 +1756,19 @@ class QtEditorLauncherWindow(QtWidgets.QWidget):
         super().__init__()
         self.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.dither_strength = float(dither_strength)
+        self._mask_seed_point: tuple[int, int] | None = None
         self._opened_editors: list[QtOklchCurveEditorWindow] = []
         self._build_ui()
         self.image_path_edit.setText(image_path or "")
         self.alpha_mask_path_edit.setText(alpha_mask_path or "")
         self.curve_path_edit.setText(curve_path or "")
         self.curve_output_path_edit.setText(curve_output_path or "")
+        self._set_initial_mask_mode("external" if alpha_mask_path else "image-alpha")
+        self._refresh_previews()
 
     def _build_ui(self):
         self.setWindowTitle("Texture-Map-Toolbox Launcher")
-        self.resize(760, 320)
+        self.resize(1200, 860)
 
         root_layout = QtWidgets.QVBoxLayout(self)
         root_layout.setContentsMargins(20, 20, 20, 20)
@@ -994,9 +1789,20 @@ class QtEditorLauncherWindow(QtWidgets.QWidget):
         root_layout.addWidget(title_label)
         root_layout.addWidget(subtitle_label)
 
+        content_layout = QtWidgets.QHBoxLayout()
+        content_layout.setSpacing(18)
+        root_layout.addLayout(content_layout, 1)
+
+        controls_widget = QtWidgets.QWidget()
+        controls_layout = QtWidgets.QVBoxLayout(controls_widget)
+        controls_layout.setContentsMargins(0, 0, 0, 0)
+        controls_layout.setSpacing(12)
+        content_layout.addWidget(controls_widget, 1)
+
         form_layout = QtWidgets.QGridLayout()
         form_layout.setHorizontalSpacing(10)
         form_layout.setVerticalSpacing(10)
+        controls_layout.addLayout(form_layout)
 
         self.image_path_edit = QtWidgets.QLineEdit()
         self.alpha_mask_path_edit = QtWidgets.QLineEdit()
@@ -1008,7 +1814,7 @@ class QtEditorLauncherWindow(QtWidgets.QWidget):
         self.curve_path_edit.setPlaceholderText("Optional initial curves JSON")
         self.curve_output_path_edit.setPlaceholderText("Optional curve export JSON path")
 
-        self._add_path_row(
+        _, self.use_sample_button = self._add_path_row(
             form_layout,
             row=0,
             label_text="Input Image",
@@ -1017,18 +1823,39 @@ class QtEditorLauncherWindow(QtWidgets.QWidget):
             secondary_text="Use Sample",
             secondary_handler=self._use_bundled_sample,
         )
-        self._add_path_row(
-            form_layout,
+
+        mask_mode_group = QtWidgets.QGroupBox("Mask Source")
+        mask_mode_layout = QtWidgets.QVBoxLayout(mask_mode_group)
+        mask_mode_layout.setSpacing(8)
+        self.use_image_alpha_radio = QtWidgets.QRadioButton("Use image alpha / no extra mask")
+        self.load_mask_radio = QtWidgets.QRadioButton("Load mask file")
+        self.pick_region_radio = QtWidgets.QRadioButton("Pick connected region from image")
+        mask_mode_layout.addWidget(self.use_image_alpha_radio)
+        mask_mode_layout.addWidget(self.load_mask_radio)
+        mask_mode_layout.addWidget(self.pick_region_radio)
+        controls_layout.addWidget(mask_mode_group)
+
+        mask_form_layout = QtWidgets.QGridLayout()
+        mask_form_layout.setHorizontalSpacing(10)
+        mask_form_layout.setVerticalSpacing(10)
+        controls_layout.addLayout(mask_form_layout)
+        self.alpha_mask_browse_button, self.alpha_mask_clear_button = self._add_path_row(
+            mask_form_layout,
             row=1,
             label_text="Alpha Mask",
             line_edit=self.alpha_mask_path_edit,
             browse_handler=self._browse_alpha_mask,
             secondary_text="Clear",
-            secondary_handler=lambda: self.alpha_mask_path_edit.clear(),
+            secondary_handler=self._clear_alpha_mask,
         )
+
+        file_form_layout = QtWidgets.QGridLayout()
+        file_form_layout.setHorizontalSpacing(10)
+        file_form_layout.setVerticalSpacing(10)
+        controls_layout.addLayout(file_form_layout)
         self._add_path_row(
-            form_layout,
-            row=2,
+            file_form_layout,
+            row=0,
             label_text="Initial Curves",
             line_edit=self.curve_path_edit,
             browse_handler=self._browse_curve_json,
@@ -1036,8 +1863,8 @@ class QtEditorLauncherWindow(QtWidgets.QWidget):
             secondary_handler=lambda: self.curve_path_edit.clear(),
         )
         self._add_path_row(
-            form_layout,
-            row=3,
+            file_form_layout,
+            row=1,
             label_text="Curve Output",
             line_edit=self.curve_output_path_edit,
             browse_handler=self._browse_curve_output_path,
@@ -1045,7 +1872,33 @@ class QtEditorLauncherWindow(QtWidgets.QWidget):
             secondary_handler=lambda: self.curve_output_path_edit.clear(),
         )
 
-        root_layout.addLayout(form_layout)
+        controls_layout.addStretch(1)
+
+        previews_widget = QtWidgets.QWidget()
+        previews_layout = QtWidgets.QHBoxLayout(previews_widget)
+        previews_layout.setContentsMargins(0, 0, 0, 0)
+        previews_layout.setSpacing(12)
+        content_layout.addWidget(previews_widget, 1)
+
+        input_preview_group = QtWidgets.QGroupBox("Input Image Preview")
+        input_preview_layout = QtWidgets.QVBoxLayout(input_preview_group)
+        self.input_image_preview_label = ImagePreviewLabel("Input Image Preview")
+        self.input_image_preview_label.setMinimumSize(320, 320)
+        self.input_image_info_label = QtWidgets.QLabel("Choose an input image to preview it.")
+        self.input_image_info_label.setWordWrap(True)
+        input_preview_layout.addWidget(self.input_image_preview_label, 1)
+        input_preview_layout.addWidget(self.input_image_info_label)
+        previews_layout.addWidget(input_preview_group, 1)
+
+        mask_preview_group = QtWidgets.QGroupBox("Mask Preview")
+        mask_preview_layout = QtWidgets.QVBoxLayout(mask_preview_group)
+        self.mask_preview_label = ImagePreviewLabel("Mask Preview")
+        self.mask_preview_label.setMinimumSize(320, 320)
+        self.mask_preview_info_label = QtWidgets.QLabel("Choose a mask source to preview it.")
+        self.mask_preview_info_label.setWordWrap(True)
+        mask_preview_layout.addWidget(self.mask_preview_label, 1)
+        mask_preview_layout.addWidget(self.mask_preview_info_label)
+        previews_layout.addWidget(mask_preview_group, 1)
 
         action_layout = QtWidgets.QHBoxLayout()
         action_layout.addStretch(1)
@@ -1061,6 +1914,12 @@ class QtEditorLauncherWindow(QtWidgets.QWidget):
 
         self.open_editor_button.clicked.connect(self.launch_selected_editor)
         self.close_button.clicked.connect(self.close)
+        self.image_path_edit.textChanged.connect(self._on_image_path_changed)
+        self.alpha_mask_path_edit.textChanged.connect(self._refresh_mask_preview)
+        self.use_image_alpha_radio.toggled.connect(self._on_mask_mode_changed)
+        self.load_mask_radio.toggled.connect(self._on_mask_mode_changed)
+        self.pick_region_radio.toggled.connect(self._on_mask_mode_changed)
+        self.input_image_preview_label.image_point_clicked.connect(self._handle_image_preview_click)
 
     def _add_path_row(
         self,
@@ -1083,6 +1942,203 @@ class QtEditorLauncherWindow(QtWidgets.QWidget):
         form_layout.addWidget(line_edit, row, 1)
         form_layout.addWidget(browse_button, row, 2)
         form_layout.addWidget(secondary_button, row, 3)
+        return browse_button, secondary_button
+
+    def _set_initial_mask_mode(self, initial_mask_mode: str):
+        if initial_mask_mode == "external":
+            self.load_mask_radio.setChecked(True)
+        elif initial_mask_mode == "interactive-seed":
+            self.pick_region_radio.setChecked(True)
+        else:
+            self.use_image_alpha_radio.setChecked(True)
+
+    def _mask_mode(self) -> str:
+        if self.load_mask_radio.isChecked():
+            return "external"
+        if self.pick_region_radio.isChecked():
+            return "interactive-seed"
+        return "image-alpha"
+
+    def _sync_mask_controls(self):
+        controls_enabled = self.load_mask_radio.isChecked()
+        self.alpha_mask_path_edit.setEnabled(controls_enabled)
+        self.alpha_mask_browse_button.setEnabled(controls_enabled)
+        self.alpha_mask_clear_button.setEnabled(controls_enabled)
+        self.input_image_preview_label.set_click_enabled(self._mask_mode() == "interactive-seed")
+
+    def _on_image_path_changed(self):
+        self._mask_seed_point = None
+        self._refresh_previews()
+
+    def _on_mask_mode_changed(self):
+        self._sync_mask_controls()
+        self._refresh_previews()
+
+    def _handle_image_preview_click(self, row: int, column: int):
+        if self._mask_mode() != "interactive-seed":
+            return
+        self._mask_seed_point = (int(row), int(column))
+        self._refresh_previews()
+
+    def _clear_alpha_mask(self):
+        self.alpha_mask_path_edit.clear()
+        self.use_image_alpha_radio.setChecked(True)
+
+    def _refresh_previews(self):
+        self._refresh_image_preview()
+        self._refresh_mask_preview()
+
+    def _refresh_image_preview(self):
+        image_path = self._line_edit_text_or_none(self.image_path_edit)
+        if image_path is None:
+            _set_preview_panel_state(
+                self.input_image_preview_label,
+                self.input_image_info_label,
+                preview_rgb=None,
+                placeholder_text="Input Image Preview",
+                info_text="Choose an input image to preview it.",
+            )
+            return
+        try:
+            preview_rgb, image_shape = _load_image_preview_uint8(image_path)
+        except Exception as exc:  # noqa: BLE001
+            _set_preview_panel_state(
+                self.input_image_preview_label,
+                self.input_image_info_label,
+                preview_rgb=None,
+                placeholder_text="Input Image Preview",
+                info_text=f"Failed to preview input image: {exc}",
+                info_style="color: #ff9b9b;",
+            )
+            return
+        if self._mask_mode() == "interactive-seed":
+            summary = "Click one pixel to remove its connected region from the mask preview."
+            if self._mask_seed_point is not None:
+                summary = (
+                    "Click one pixel to remove its connected region from the mask preview. "
+                    f"Selected seed: x={self._mask_seed_point[1]}, y={self._mask_seed_point[0]}."
+                )
+        else:
+            summary = "Previewing the selected input image."
+        _set_preview_panel_state(
+            self.input_image_preview_label,
+            self.input_image_info_label,
+            preview_rgb=preview_rgb,
+            placeholder_text="Input Image Preview",
+            info_text=_format_image_preview_info(image_shape, summary=summary),
+            source_image_shape=image_shape,
+        )
+
+    def _refresh_mask_preview(self):
+        image_path = self._line_edit_text_or_none(self.image_path_edit)
+        expected_shape = _load_optional_image_shape(image_path)
+        mask_mode = self._mask_mode()
+        if mask_mode == "external":
+            mask_path = self._line_edit_text_or_none(self.alpha_mask_path_edit)
+            if mask_path is None:
+                _set_preview_panel_state(
+                    self.mask_preview_label,
+                    self.mask_preview_info_label,
+                    preview_rgb=None,
+                    placeholder_text="Mask Preview",
+                    info_text="Choose an external mask file to preview it.",
+                )
+                return
+            try:
+                preview_rgb, mask_shape, valid_pixels = _load_mask_preview_uint8(mask_path)
+                info_text, info_style = _format_mask_preview_info(
+                    mask_shape,
+                    valid_pixels,
+                    summary="Previewing the selected external mask.",
+                    expected_shape=expected_shape,
+                )
+            except Exception as exc:  # noqa: BLE001
+                _set_preview_panel_state(
+                    self.mask_preview_label,
+                    self.mask_preview_info_label,
+                    preview_rgb=None,
+                    placeholder_text="Mask Preview",
+                    info_text=f"Failed to preview mask: {exc}",
+                    info_style="color: #ff9b9b;",
+                )
+                return
+        elif mask_mode == "interactive-seed":
+            if image_path is None:
+                _set_preview_panel_state(
+                    self.mask_preview_label,
+                    self.mask_preview_info_label,
+                    preview_rgb=None,
+                    placeholder_text="Mask Preview",
+                    info_text="Choose an input image, then click one pixel in the image preview.",
+                )
+                return
+            if self._mask_seed_point is None:
+                _set_preview_panel_state(
+                    self.mask_preview_label,
+                    self.mask_preview_info_label,
+                    preview_rgb=None,
+                    placeholder_text="Mask Preview",
+                    info_text="Click one pixel in the input image preview to build a connected-region mask.",
+                )
+                return
+            try:
+                preview_rgb, mask_shape, valid_pixels, summary = _load_seeded_mask_preview_uint8(
+                    image_path,
+                    self._mask_seed_point,
+                )
+                info_text, info_style = _format_mask_preview_info(
+                    mask_shape,
+                    valid_pixels,
+                    summary=summary,
+                    expected_shape=expected_shape,
+                )
+            except Exception as exc:  # noqa: BLE001
+                _set_preview_panel_state(
+                    self.mask_preview_label,
+                    self.mask_preview_info_label,
+                    preview_rgb=None,
+                    placeholder_text="Mask Preview",
+                    info_text=f"Connected-region preview failed: {exc}",
+                    info_style="color: #ff9b9b;",
+                )
+                return
+        else:
+            if image_path is None:
+                _set_preview_panel_state(
+                    self.mask_preview_label,
+                    self.mask_preview_info_label,
+                    preview_rgb=None,
+                    placeholder_text="Mask Preview",
+                    info_text="Choose an input image to preview its embedded or implicit mask.",
+                )
+                return
+            try:
+                preview_rgb, mask_shape, valid_pixels, summary = _load_embedded_or_implicit_mask_preview_uint8(image_path)
+                info_text, info_style = _format_mask_preview_info(
+                    mask_shape,
+                    valid_pixels,
+                    summary=summary,
+                    expected_shape=expected_shape,
+                )
+            except Exception as exc:  # noqa: BLE001
+                _set_preview_panel_state(
+                    self.mask_preview_label,
+                    self.mask_preview_info_label,
+                    preview_rgb=None,
+                    placeholder_text="Mask Preview",
+                    info_text=f"Failed to preview mask source: {exc}",
+                    info_style="color: #ff9b9b;",
+                )
+                return
+
+        _set_preview_panel_state(
+            self.mask_preview_label,
+            self.mask_preview_info_label,
+            preview_rgb=preview_rgb,
+            placeholder_text="Mask Preview",
+            info_text=info_text,
+            info_style=info_style,
+        )
 
     def _browse_existing_file(self, title: str, filter_text: str) -> str | None:
         selected_path, _ = QtWidgets.QFileDialog.getOpenFileName(self, title, os.getcwd(), filter_text)
@@ -1104,6 +2160,7 @@ class QtEditorLauncherWindow(QtWidgets.QWidget):
             "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.webp)",
         )
         if selected_path is not None:
+            self.load_mask_radio.setChecked(True)
             self.alpha_mask_path_edit.setText(selected_path)
 
     def _browse_curve_json(self):
@@ -1145,22 +2202,30 @@ class QtEditorLauncherWindow(QtWidgets.QWidget):
             self._show_error("Input Image Required", "Please select an input image before opening the editor.")
             return None
 
-        alpha_mask_path = self._line_edit_text_or_none(self.alpha_mask_path_edit)
-        resolved_alpha_mask_path, auto_detect_mask, prompt_was_shown, cancelled = _resolve_qt_mask_loading(
-            self,
-            image_path,
-            alpha_mask_path,
-            prompt_user=show_window,
-        )
-        if cancelled:
-            self.status_label.setText("Open editor cancelled.")
-            return None
+        mask_mode = self._mask_mode()
+        alpha_mask_path = None
+        mask_seed_point = None
+        if mask_mode == "external":
+            alpha_mask_path = self._line_edit_text_or_none(self.alpha_mask_path_edit)
+            if alpha_mask_path is None:
+                self._show_error("Alpha Mask Required", "Please choose an alpha mask file first.")
+                return None
+            image_shape = _load_optional_image_shape(image_path)
+            mask_shape = _load_optional_image_shape(alpha_mask_path)
+            if image_shape is not None and mask_shape is not None and tuple(image_shape) != tuple(mask_shape):
+                self._show_error("Alpha Mask Size Mismatch", "Alpha mask size must match the selected input image.")
+                return None
+        elif mask_mode == "interactive-seed":
+            if self._mask_seed_point is None:
+                self._show_error("Seed Pixel Required", "Please click one pixel in the input image preview first.")
+                return None
+            mask_seed_point = self._mask_seed_point
 
         try:
             editor_window = build_qt_editor(
                 image_path,
-                alpha_mask_path=resolved_alpha_mask_path,
-                auto_detect_mask=auto_detect_mask,
+                alpha_mask_path=alpha_mask_path,
+                mask_seed_point=mask_seed_point,
                 curve_path=self._line_edit_text_or_none(self.curve_path_edit),
                 curve_output_path=self._line_edit_text_or_none(self.curve_output_path_edit),
                 dither_strength=self.dither_strength,
@@ -1169,11 +2234,10 @@ class QtEditorLauncherWindow(QtWidgets.QWidget):
             self._show_error("Open Editor Failed", str(exc))
             return None
 
-        editor_window.show_warning_dialogs = show_window and not prompt_was_shown
+        editor_window.show_warning_dialogs = show_window
         if show_window:
             editor_window.show()
-            if not prompt_was_shown:
-                editor_window._show_image_warnings("Input Image Warning", getattr(editor_window, "image_warnings", ()))
+            editor_window._show_image_warnings("Input Image Warning", getattr(editor_window, "image_warnings", ()))
         self._opened_editors.append(editor_window)
         editor_window.destroyed.connect(
             lambda *_args: self._opened_editors.remove(editor_window)
@@ -1190,7 +2254,7 @@ def build_qt_editor(
     image_path: str | None,
     *,
     alpha_mask_path: str | None = None,
-    auto_detect_mask: bool = False,
+    mask_seed_point: tuple[int, int] | None = None,
     curve_path: str | None = None,
     curve_output_path: str | None = None,
     dither_strength: float = DITHER_STRENGTH,
@@ -1201,7 +2265,7 @@ def build_qt_editor(
     loaded_image = load_image_data(
         resolved_image_path,
         alpha_mask_path=alpha_mask_path,
-        auto_detect_mask=auto_detect_mask,
+        mask_seed_point=mask_seed_point,
     )
     rgb_float = loaded_image.rgb_float
     oklch_float = loaded_image.oklch_float
@@ -1251,6 +2315,7 @@ def launch_qt_editor(
     image_path: str | None,
     *,
     alpha_mask_path: str | None = None,
+    mask_seed_point: tuple[int, int] | None = None,
     curve_path: str | None = None,
     curve_output_path: str | None = None,
     dither_strength: float = DITHER_STRENGTH,
@@ -1259,10 +2324,11 @@ def launch_qt_editor(
 ) -> QtOklchCurveEditorWindow | None:
     """Launch the Qt MVP editor and optionally enter the Qt event loop."""
     app, owns_app = _ensure_qt_application()
-    resolved_alpha_mask_path, auto_detect_mask, prompt_was_shown, cancelled = _resolve_qt_mask_loading(
+    resolved_alpha_mask_path, resolved_mask_seed_point, prompt_was_shown, cancelled = _resolve_qt_mask_loading(
         None,
         resolve_input_image_path(image_path),
         alpha_mask_path,
+        mask_seed_point,
         prompt_user=show_warning_dialogs,
     )
     if cancelled:
@@ -1270,7 +2336,7 @@ def launch_qt_editor(
     window = build_qt_editor(
         image_path,
         alpha_mask_path=resolved_alpha_mask_path,
-        auto_detect_mask=auto_detect_mask,
+        mask_seed_point=resolved_mask_seed_point,
         curve_path=curve_path,
         curve_output_path=curve_output_path,
         dither_strength=dither_strength,
