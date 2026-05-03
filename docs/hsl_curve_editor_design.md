@@ -10,6 +10,8 @@
 
 **当前 GUI 实现**：[`texture_map_toolbox/gui/editor.py`](../texture_map_toolbox/gui/editor.py)
 
+**Qt MVP 实现**：[`texture_map_toolbox/gui/qt_editor.py`](../texture_map_toolbox/gui/qt_editor.py)
+
 **推荐 CLI 入口**：`python -m texture_map_toolbox editor ...`
 
 该编辑器已经和 [`texture_map_toolbox/core/luma.py`](../texture_map_toolbox/core/luma.py) 共用同一套 Oklch 主流程，默认状态下会继承基础模型，因此在未手动改曲线时，和离线主脚本的默认输出一致。
@@ -23,6 +25,7 @@
 - Core：[`texture_map_toolbox/core/luma.py`](../texture_map_toolbox/core/luma.py)
 - API：[`texture_map_toolbox/api/luma.py`](../texture_map_toolbox/api/luma.py)
 - GUI：[`texture_map_toolbox/gui/editor.py`](../texture_map_toolbox/gui/editor.py)
+- GUI：[`texture_map_toolbox/gui/qt_editor.py`](../texture_map_toolbox/gui/qt_editor.py)
 - CLI：[`texture_map_toolbox/cli/editor.py`](../texture_map_toolbox/cli/editor.py)
 
 ### 1. 基础模型
@@ -73,7 +76,24 @@
 - `S` / `Ctrl+S`：导出当前 Lt/Ct/ht 为 JSON
 - `Enter`：执行一次全分辨率重建
 
-导出的 JSON 与 [`scripts/luma_color_map.py`](../scripts/luma_color_map.py) 的 `--curves` 输入格式一致，因此可以直接拿来喂主脚本。
+Qt MVP 当前额外提供：
+
+- 原图与预览图并排显示
+- 三张独立曲线图的可拖拽点编辑
+- `Lt(y)` 面板中的灰度背景与当前输出 Lightness 直方图叠加
+- `Ct(L')` / `ht(L')` 面板中的动态色彩背景
+- 窗口内按钮触发保存曲线和全分辨率确认
+- 为 `Lt(y)` / `Ct(L')` / `ht(L')` 分别单独加载目标图片信息
+
+其中目标图片加载逻辑为：
+
+- `Lt(y)`：读取目标图的 Lightness 样本，并调用 `fit_monotonic_lightness_transfer_curve(...)` 自动生成单调 Lightness 转换曲线
+- `Ct(L')`：读取目标图并直接使用其建模后的 `C(y)` 关键点作为当前 Chroma 状态曲线控制点
+- `ht(L')`：读取目标图并直接使用其建模后的 `h(y)` 关键点作为当前 Hue 状态曲线控制点
+
+这样可以让三条曲线分别从不同目标图像吸收参考信息，而不是只能手工从零拖点。
+
+导出的 JSON 与当前 `texture_map_toolbox luma --curves ...` / `python -m texture_map_toolbox luma --curves ...` 的输入格式一致，因此可以直接拿来喂当前 CLI 主流程。
 
 如果从 Python 直接集成，建议优先走 [`texture_map_toolbox/api/luma.py`](../texture_map_toolbox/api/luma.py) 而不是兼容脚本路径。
 
@@ -112,7 +132,7 @@
 1. Chroma / Hue 默认会继承基础模型关键点，因此点数较多，编辑精度高但 UI 会更密。
 2. 当前没有原生文件对话框，输入图和曲线文件都通过命令行参数传入。
 3. 当前没有“控制点数量调整”面板，也没有数值输入框。
-4. 当前 GUI 仍是 matplotlib 版，重点是验证算法和工作流，不是最终形态。
+4. 当前 Qt 版本仍是 MVP，重点是验证新的桌面交互结构，不是最终形态。
 
 ---
 

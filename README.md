@@ -108,11 +108,7 @@ texture-map-toolbox luma path/to/image.png --algorithm original
 texture-map-toolbox editor path/to/image.png --curves path/to/curves.json
 ```
 
-仓库内置样例图：
-
-```bash
-data/mtmtPonyTail_custom.png
-```
+仓库内置样例图放在 `data/` 目录下；如果命令行没有显式传入图片路径，工具会优先尝试约定的样例文件名，并在找不到时回退到 `data/` 目录里第一个可用图片。
 
 `docs/examples/*.json` 中的 `image_path` 是占位符，使用前请替换成你的实际输入图路径。
 

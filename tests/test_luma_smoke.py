@@ -21,15 +21,16 @@ from texture_map_toolbox.gui.luma_plots import plot_analysis, plot_comparison
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SAMPLE_IMAGE = REPO_ROOT / "data" / "mtmtPonyTail_custom.png"
+SAMPLE_IMAGE = Path(resolve_input_image_path(None))
 
 
 class LumaSmokeTests(unittest.TestCase):
     def tearDown(self):
         plt.close("all")
 
-    def test_default_sample_resolution_uses_custom_asset(self):
+    def test_default_sample_resolution_uses_bundled_asset(self):
         self.assertEqual(Path(resolve_input_image_path(None)), SAMPLE_IMAGE.resolve())
+        self.assertEqual(SAMPLE_IMAGE.parent.resolve(), (REPO_ROOT / "data").resolve())
 
     def test_original_workflow_runs(self):
         result = run_luma_workflow(

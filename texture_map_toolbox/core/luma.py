@@ -25,6 +25,26 @@ DEFAULT_SAMPLE_IMAGE_CANDIDATES = (
     DATA_DIRECTORY / "mtmtPonyTail_custom.png",
     DATA_DIRECTORY / "mtmtPonyTail.png",
 )
+SUPPORTED_IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp")
+
+
+def _iter_default_sample_image_candidates():
+    """Yield preferred bundled samples, then any other supported image in the data directory."""
+    seen_paths: set[Path] = set()
+    for candidate in DEFAULT_SAMPLE_IMAGE_CANDIDATES:
+        if candidate not in seen_paths:
+            seen_paths.add(candidate)
+            yield candidate
+
+    if not DATA_DIRECTORY.exists():
+        return
+
+    for candidate in sorted(DATA_DIRECTORY.iterdir()):
+        if candidate in seen_paths:
+            continue
+        if candidate.is_file() and candidate.suffix.lower() in SUPPORTED_IMAGE_SUFFIXES:
+            seen_paths.add(candidate)
+            yield candidate
 
 
 def resolve_input_image_path(image_path: str | None) -> str:
@@ -35,7 +55,7 @@ def resolve_input_image_path(image_path: str | None) -> str:
             raise FileNotFoundError(f"input image not found: {resolved_path}")
         return str(resolved_path)
 
-    for candidate in DEFAULT_SAMPLE_IMAGE_CANDIDATES:
+    for candidate in _iter_default_sample_image_candidates():
         if candidate.exists():
             return str(candidate)
 

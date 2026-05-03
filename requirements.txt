@@ -4,3 +4,5 @@ matplotlib
 colour-science
 scipy
 Pillow
+PySide6
+pyqtgraph

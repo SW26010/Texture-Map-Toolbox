@@ -11,7 +11,7 @@
 - GUI 绘图：[`texture_map_toolbox/gui/luma_plots.py`](../texture_map_toolbox/gui/luma_plots.py)
 - CLI：[`texture_map_toolbox/cli/luma.py`](../texture_map_toolbox/cli/luma.py)
 
-如果调用方没有显式提供图片路径，当前默认样例图会回退到 [`data/mtmtPonyTail_custom.png`](../data/mtmtPonyTail_custom.png)。
+如果调用方没有显式提供图片路径，当前默认样例图会优先尝试内置候选文件名；若这些文件不存在，则自动回退到 `data/` 目录里第一个可用的受支持图片。
 
 ## 原理
 
@@ -196,7 +196,7 @@ python -m texture_map_toolbox luma path/to/image.png --algorithm original --curv
 
 ## 测试覆盖
 
-当前仓库提供一套基于 [`data/mtmtPonyTail_custom.png`](../data/mtmtPonyTail_custom.png) 的 smoke tests，覆盖：
+当前仓库提供一套基于仓库内置样例图的 smoke tests，覆盖：
 
 - core 工作流
 - API 调用

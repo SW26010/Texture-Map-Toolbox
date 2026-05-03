@@ -29,6 +29,12 @@ def configure_cli_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentPa
         default=DITHER_STRENGTH,
         help="Optional pre-curve dither amplitude applied on the input lightness axis.",
     )
+    parser.add_argument(
+        "--backend",
+        choices=("matplotlib", "qt"),
+        default="matplotlib",
+        help="Select the editor backend. `qt` launches the new MVP Qt editor.",
+    )
     return parser
 
 
@@ -49,6 +55,17 @@ def execute_cli(args: argparse.Namespace) -> int:
     resolved_image_path = resolve_input_image_path(args.image_path)
     print(f"Loading: {resolved_image_path}")
     print("Building Oklch base model done. Opening editor...")
+    if args.backend == "qt":
+        from texture_map_toolbox.gui.qt_editor import launch_qt_editor
+
+        launch_qt_editor(
+            resolved_image_path,
+            curve_path=args.curve_path,
+            curve_output_path=args.curve_output_path,
+            dither_strength=args.dither_strength,
+        )
+        return 0
+
     editor = launch_editor(
         resolved_image_path,
         curve_path=args.curve_path,

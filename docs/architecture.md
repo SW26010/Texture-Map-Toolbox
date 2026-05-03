@@ -42,11 +42,13 @@ API 层本身不再承载实现，只是对 core 的稳定导出面。
 ### 3. GUI 层
 
 - [`texture_map_toolbox/gui/editor.py`](../texture_map_toolbox/gui/editor.py)
+- [`texture_map_toolbox/gui/qt_editor.py`](../texture_map_toolbox/gui/qt_editor.py)
 - [`texture_map_toolbox/gui/luma_plots.py`](../texture_map_toolbox/gui/luma_plots.py)
 
 GUI 层专门承载交互和可视化职责，包括：
 
 - matplotlib 状态曲线编辑器
+- Qt MVP 状态曲线编辑器
 - luma 比较图与分析图
 - 全分辨率确认时的图形展示
 
@@ -121,6 +123,14 @@ from texture_map_toolbox.gui.editor import launch_editor
 
 editor = launch_editor("path/to/image.png")
 editor.show()
+```
+
+如果要使用 Qt MVP：
+
+```python
+from texture_map_toolbox.gui.qt_editor import launch_qt_editor
+
+launch_qt_editor("path/to/image.png")
 ```
 
 ### 走命令行协议
