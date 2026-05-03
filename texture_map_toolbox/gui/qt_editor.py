@@ -1482,7 +1482,7 @@ class CurvePlotWidget(pg.PlotWidget):
 
     def set_background_rgb(self, rgb_uint8: np.ndarray):
         """Set the plot background to an RGB image."""
-        self._background_item.setImage(np.flipud(np.ascontiguousarray(rgb_uint8)), autoLevels=False)
+        self._background_item.setImage(np.ascontiguousarray(rgb_uint8), autoLevels=False)
         self._background_item.setRect(QtCore.QRectF(0.0, self._y_min, 1.0, self._y_max - self._y_min))
 
     def set_curve_line(self, y_values: np.ndarray):

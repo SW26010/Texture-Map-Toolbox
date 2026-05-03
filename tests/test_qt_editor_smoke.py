@@ -6,7 +6,7 @@ from unittest import mock
 
 import numpy as np
 from PIL import Image
-from PySide6 import QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -66,6 +66,64 @@ class QtEditorSmokeTests(unittest.TestCase):
         rgb[0:2, 6:8] = np.array([40, 40, 40], dtype=np.uint8)
         Image.fromarray(rgb, mode="RGB").save(path)
 
+    def _sample_plot_background_pixel_rgb(self, plot, x_value: float, y_value: float) -> tuple[int, int, int]:
+        overlay_items = [
+            plot.control_item,
+            plot._curve_item,
+            plot._default_curve_item,
+            plot._hist_item,
+            plot._reference_hist_item,
+        ]
+        visibility = [item.isVisible() for item in overlay_items]
+        try:
+            for item in overlay_items:
+                item.setVisible(False)
+            plot.repaint()
+            QtWidgets.QApplication.processEvents()
+            image = plot.viewport().grab().toImage().convertToFormat(QtGui.QImage.Format.Format_RGBA8888)
+        finally:
+            for item, is_visible in zip(overlay_items, visibility):
+                item.setVisible(is_visible)
+            plot.repaint()
+            QtWidgets.QApplication.processEvents()
+
+        scene_point = plot.getPlotItem().vb.mapViewToScene(QtCore.QPointF(x_value, y_value))
+        widget_point = plot.mapFromScene(scene_point)
+        pixel_x = max(0, min(image.width() - 1, int(round(widget_point.x()))))
+        pixel_y = max(0, min(image.height() - 1, int(round(widget_point.y()))))
+        color = QtGui.QColor(image.pixel(pixel_x, pixel_y))
+        return color.red(), color.green(), color.blue()
+
+    def _assert_plot_background_matches_y_direction(
+        self,
+        plot,
+        background_rgb: np.ndarray,
+        y_range: tuple[float, float],
+    ):
+        x_index = background_rgb.shape[1] // 2
+        y_min, y_max = y_range
+        for fraction in (0.1, 0.9):
+            y_value = y_min + (y_max - y_min) * fraction
+            actual_rgb = np.asarray(
+                self._sample_plot_background_pixel_rgb(plot, 0.5, y_value),
+                dtype=np.float64,
+            )
+            row_index = int(round(fraction * (background_rgb.shape[0] - 1)))
+            expected_same = background_rgb[row_index, x_index].astype(np.float64)
+            expected_flipped = background_rgb[(background_rgb.shape[0] - 1) - row_index, x_index].astype(np.float64)
+            same_distance = float(np.linalg.norm(actual_rgb - expected_same))
+            flipped_distance = float(np.linalg.norm(actual_rgb - expected_flipped))
+            self.assertLess(
+                same_distance,
+                flipped_distance,
+                msg=(
+                    f"plot background y mapping looks flipped at fraction {fraction}: "
+                    f"actual={tuple(actual_rgb.astype(int))}, "
+                    f"expected_same={tuple(expected_same.astype(int))}, "
+                    f"expected_flipped={tuple(expected_flipped.astype(int))}"
+                ),
+            )
+
     def test_qt_launcher_builds_and_opens_editor_offscreen(self):
         launcher = build_qt_editor_launcher()
         try:
@@ -120,6 +178,31 @@ class QtEditorSmokeTests(unittest.TestCase):
             state_curves = window._build_state_curves()
             self.assertEqual(state_curves.chroma_points.shape[0], window.base_model.key_y.size)
             self.assertEqual(state_curves.hue_points.shape[0], window.base_model.key_y.size)
+        finally:
+            window.close()
+
+    def test_qt_editor_curve_backgrounds_follow_view_y_direction(self):
+        window = build_qt_editor(SAMPLE_IMAGE)
+        try:
+            window.show()
+            QtWidgets.QApplication.processEvents()
+            state_curves = window._build_state_curves()
+
+            self._assert_plot_background_matches_y_direction(
+                window.lightness_plot,
+                window._build_lightness_background(),
+                (0.0, 1.0),
+            )
+            self._assert_plot_background_matches_y_direction(
+                window.chroma_plot,
+                window._build_chroma_background(state_curves),
+                window.chroma_ylim,
+            )
+            self._assert_plot_background_matches_y_direction(
+                window.hue_plot,
+                window._build_hue_background(state_curves),
+                (0.0, 360.0),
+            )
         finally:
             window.close()
 
