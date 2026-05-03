@@ -1,42 +1,63 @@
-# 金属度/光滑度贴图生成 (Metallic Smoothness Map)
+# Metallic / Smoothness 贴图工作流
 
-## 概述
+## 当前状态
 
-从一张 RGB 通道用作蒙版的输入图像出发，为不同材质区域指定金属度、光滑度和颜色属性，生成用于 PBR 渲染的贴图。
+这个方向目前主要保留为历史 notebook 实验，不属于当前统一 CLI / API / GUI 主工作流。
 
-## 原理
+当前现状是：
 
-### 输入
+- 有历史 notebook：`metallic_smoothness_map.ipynb`
+- 没有与 `luma` 对等的统一命令
+- 没有稳定的 `api.metallic_*` 调用面
+- 没有与 Qt Oklch 编辑器对等的 metallic/smoothness 专用 GUI
 
-一张 RGBA 格式的蒙版图像，其中 R、G、B 通道分别标记不同材质区域。
+换句话说，这一页现在是“历史方向说明”，不是“当前产品入口文档”。
 
-### 处理流程
+## 与当前主线的关系
 
-1. **参数配置** — 为每个通道代表的材质定义属性：
+仓库目前真正已经分层并持续维护的主线是 Oklch luma 工作流：
 
-   | 通道 | 材质   | 金属度 | 光滑度 | 颜色       |
-   |------|--------|--------|--------|------------|
-   | R    | 金缮   | 1.0    | 0.445  | #D69687FF  |
-   | G    | 陶瓷   | 0.0    | 1.0    | #FBFFFCFF  |
-   | B    | 黑锆金 | 0.0    | 0.727  | #393938FF  |
+- notebook：`luma_color_map.ipynb`
+- core：`texture_map_toolbox/core/luma.py`
+- API：`texture_map_toolbox/api/luma.py`
+- CLI：`texture_map_toolbox/cli/luma.py`
+- GUI：`texture_map_toolbox/gui/qt_editor.py`
 
-2. **蒙版生成** — 按通道阈值 (>127) 分割材质区域：
-   - `mask_r = R通道 > 127`
-   - `mask_g = G通道 > 127`
-   - `mask_b = B通道 > 127`
+如果后续重新启动 metallic/smoothness 方向，建议直接沿用这条已经验证过的结构：
 
-3. **属性写入** — 在蒙版为真的区域写入对应的材质属性值
+1. core 负责数值语义
+2. API 提供稳定调用面
+3. GUI 提供编辑与预览
+4. CLI 只做参数解析和调度
 
-4. **Alpha 通道** — 从源图像直接复制，保留透明度信息
+## 原始目标
 
-### 输出
+这条历史方向主要关注：
 
-| 贴图文件 | R 通道 | G 通道 | B 通道 | A 通道 |
-|----------|--------|--------|--------|--------|
-| `metallic_smoothness_map.png` | 金属度 | 光滑度 | 0 | 原始透明度 |
-| `color_map.png` | 材质 R | 材质 G | 材质 B | 原始透明度 |
+- 从现有贴图推断或组合 metallic / smoothness 信息
+- 分离金属区域与非金属区域
+- 提取高光、粗糙度或镜面相关结构
+- 探索与 RGB、法线、AO 等其他贴图的联合使用
 
-## 依赖
+## 目前仍有的价值
 
-- `numpy`
-- `Pillow`
+虽然它不是当前主工作流，但这部分内容仍然有两类价值：
+
+1. 保留材质贴图工具箱最早期的探索背景。
+2. 为将来重启 PBR 类贴图工具提供方向参考。
+
+更具体地说，当前 luma 主线已经验证了几件事可以直接复用到未来的 metallic/smoothness 工具：
+
+- core / API / GUI / CLI 分层
+- request / result JSON
+- 可复用的预览与编辑器框架
+- 统一的 smoke / 行为测试入口
+
+## 建议阅读顺序
+
+如果你的目标是当前仓库里最完整、最可复用、功能仍在持续演进的一条工作流，请优先阅读：
+
+1. `README.md`
+2. `docs/luma_color_map.md`
+3. `docs/hsl_curve_editor_design.md`
+4. `docs/cli.md`

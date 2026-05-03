@@ -1,160 +1,209 @@
-# Oklch 状态曲线编辑器 — 设计与性能分析
+# Oklch 状态曲线编辑器 — 当前实现与设计
+
+> 文件名保留了历史命名 `hsl_curve_editor_design.md`，但当前内容已经完全围绕 Oklch 状态曲线编辑器。
 
 ## 功能概述
 
-交互式工具，对 Oklch 主流程中的三条状态曲线进行编辑：
+交互式工具，用于编辑 Oklch 主流程中的三条状态曲线：
 
 - `Lt(y)`：输入轴 `L0` 到输出 Lightness 的映射
 - `Ct(L')`：最终 Lightness 到输出 Chroma 的映射
 - `ht(L')`：最终 Lightness 到输出 Hue 的映射
 
-**当前 GUI 实现**：[`texture_map_toolbox/gui/editor.py`](../texture_map_toolbox/gui/editor.py)
+当前实现包括两个后端：
 
-**Qt MVP 实现**：[`texture_map_toolbox/gui/qt_editor.py`](../texture_map_toolbox/gui/qt_editor.py)
+- `texture_map_toolbox/gui/editor.py`：历史 matplotlib 版
+- `texture_map_toolbox/gui/qt_editor.py`：当前推荐的 Qt 版
 
-**推荐 CLI 入口**：`python -m texture_map_toolbox` 或 `python -m texture_map_toolbox editor --backend qt`
+推荐入口：
 
-该编辑器已经和 [`texture_map_toolbox/core/luma.py`](../texture_map_toolbox/core/luma.py) 共用同一套 Oklch 主流程，默认状态下会继承基础模型，因此在未手动改曲线时，和离线主脚本的默认输出一致。
+- `python -m texture_map_toolbox`
+- `python -m texture_map_toolbox editor --backend qt`
+
+Qt 编辑器与主流程共用同一套 Oklch 语义，默认状态下会回退到基础模型，因此在未手动修改曲线时，输出与默认离线工作流一致。
 
 ---
 
 ## 当前架构
 
-当前层级关系为：
+层级关系为：
 
-- Core：[`texture_map_toolbox/core/luma.py`](../texture_map_toolbox/core/luma.py)
-- API：[`texture_map_toolbox/api/luma.py`](../texture_map_toolbox/api/luma.py)
-- GUI：[`texture_map_toolbox/gui/editor.py`](../texture_map_toolbox/gui/editor.py)
-- GUI：[`texture_map_toolbox/gui/qt_editor.py`](../texture_map_toolbox/gui/qt_editor.py)
-- CLI：[`texture_map_toolbox/cli/editor.py`](../texture_map_toolbox/cli/editor.py)
+- Core：`texture_map_toolbox/core/luma.py`
+- API：`texture_map_toolbox/api/luma.py`
+- GUI：`texture_map_toolbox/gui/editor.py`
+- GUI：`texture_map_toolbox/gui/qt_editor.py`
+- CLI：`texture_map_toolbox/cli/editor.py`
 
 ### 1. 基础模型
 
-编辑器启动时先执行一次离线建模：
+编辑器启动时会先完成一次基础建模：
 
-1. 读取原图并转换到 Oklch
-2. 使用原始 Oklch 的 `L0` 作为输入轴
-3. 从样本云拟合基础 `C(y)` / `h(y)` 模型
+1. 读取原图和最终采用的 mask
+2. 转换到 Oklch
+3. 使用原始 Oklch 的 `L0` 作为输入轴
+4. 从样本云拟合基础 `C(y)` / `h(y)` 模型
 
-Qt 版本现在额外提供一个启动页，用来在 GUI 内完成以下输入选择：
+Qt 版本还提供一个启动页，可以在 GUI 内选择：
 
 - 原图路径
 - 可选 alpha mask 路径
 - 可选初始 curves JSON
 - 可选 curves 导出路径
 
-也就是说，用户现在可以直接无参数启动 GUI，再在图形界面里完成加载流程，而不是先通过命令行把这些路径拼出来。编辑器打开成功后，启动页会自动关闭。
+### 2. 控制点与默认模式
 
-### 2. 控制点语义
+编辑器中的三组控制点最终对应 `Lt / Ct / ht`，但 Qt 版本把“显示 handles”与“实际默认基线”分开处理：
 
-编辑器中的三组控制点直接对应最终状态曲线：
+- Lightness：默认就是 identity，显示与实际语义一致
+- Chroma / Hue：默认只显示稀疏 sampled handles，但默认模式下真正传给 `build_state_curve_set(...)` 的 payload 是 `None`，因此会回退到基础模型的精确基线
 
-- Lightness 曲线：固定数量的均匀 `x` 点
-- Chroma 曲线：默认继承基础模型关键点
-- Hue 曲线：默认继承基础模型关键点
+当前默认 visible handles 数量是 `STATE_CURVE_CTRL_POINTS`，也就是 16 个左右的稀疏关键点；虚线参考线始终显示精确基线。
 
-如果通过 `--curves` 加载外部 JSON，则编辑器会直接使用该文件中的控制点作为初始状态。
+### 3. 编辑模式与保存语义
 
-### 3. 预览路径
+一旦发生以下任一行为，对应曲线就会进入 override 模式：
 
-实时预览不直接在每个像素上跑完整的高精度主流程，而是使用一条轻量路径：
+- 手动拖动控制点
+- 调整 Key Points 数量并保留当前曲线值
+- 从目标图导入该曲线
 
-1. 根据当前 Lt/Ct/ht 构建 `StateCurveSet`
-2. 在 `[0, 1]` 上采样一条 512 项的 Oklch 预览 LUT
+Reset to Default 会让曲线回到默认模式。当前保存 JSON 时：
+
+- 只保存已进入 override 模式的曲线
+- Reset 后的曲线键会从 JSON 中省略
+
+### 4. 预览路径
+
+实时预览不会在每一帧上跑完整离线主流程，而是走共享的快速路径：
+
+1. 构建 `StateCurveSet`
+2. 在 `[0, 1]` 上采样 512 项预览 LUT
 3. 对 LUT 执行 chroma-only gamut compression
-4. 在缩小预览图上用 `np.take` 做快速查表重着色
+4. 在缩小预览图上做查表重着色
 
-这条快速路径现在已经和 CLI 的 `python -m texture_map_toolbox luma --algorithm fast ...` 共用同一组 helper，因此后续 GUI、CLI 和编辑器不会再各自维护一套不同的预览算法实现。
+这条路径和 CLI 的 `--algorithm fast` 共用同一组 helper。
 
-这保留了当前 matplotlib 版编辑器最重要的优化点：
+### 5. 全分辨率确认
 
-- 缩图预览
-- 预分配缓冲区
-- LUT 查表而不是逐像素 Python 循环
-
-### 4. 全分辨率确认
-
-用户按 `Enter` 时，编辑器会调用主流程中的全分辨率重建函数，执行一次完整生成，并显示结果对比图。
+Qt 版本通过按钮触发一次完整重建，并弹出对比图；matplotlib 版本仍保留旧式快捷键与窗口流。
 
 ---
 
-## 当前交互
+## Qt 版本当前交互
 
-- 左键拖拽：移动控制点
-- 右键点击控制点：重置该点到编辑器初始值
-- `S` / `Ctrl+S`：导出当前 Lt/Ct/ht 为 JSON
-- `Enter`：执行一次全分辨率重建
+### 1. 曲线面板
 
-Qt MVP 当前额外提供：
+每条曲线都包含：
 
-- 原图与预览图并排显示
-- 三张独立曲线图的可拖拽点编辑
-- `Lt(y)` 面板中的灰度背景与当前输出 Lightness 直方图叠加
-- `Ct(L')` / `ht(L')` 面板中的动态色彩背景
-- 窗口内按钮触发保存曲线和全分辨率确认
-- 一个内置 target 图片选择器：先选一张图，再用 L / C / H 复选框决定把它应用到哪些曲线
-- 输入图和 target 图在没有可用 mask 时的自动检测提示流程
+- 一张 plot 背景图
+- 一条当前生效曲线
+- 一条默认虚线参考曲线
+- 一组可拖拽控制点
+- Key Points 数量调节 spinbox
+- Reset to Default 按钮
+- 当前模式标签（默认/已编辑）
 
-其中目标图片加载逻辑为：
+其中：
 
-- `Lt(y)`：读取目标图的 Lightness 样本，并调用 `fit_monotonic_lightness_transfer_curve(...)` 自动生成单调 Lightness 转换曲线
-- `Ct(L')`：读取目标图并直接使用其建模后的 `C(y)` 关键点作为当前 Chroma 状态曲线控制点
-- `ht(L')`：读取目标图并直接使用其建模后的 `h(y)` 关键点作为当前 Hue 状态曲线控制点
+- `Lt(y)` 面板叠加当前输出 Lightness 直方图和可选 target 参考直方图
+- `Ct(L')` 和 `ht(L')` 面板使用动态色彩背景
 
-这样可以让三条曲线分别从不同目标图像吸收参考信息，也可以一次性从同一张目标图像吸收多条曲线的参考信息，而不是只能手工从零拖点。
+### 2. 控制点拖拽
 
-当前 mask 相关交互约定为：
+Qt 版当前的拖拽语义是：
 
-- 用户显式提供的 mask 始终优先于图像自带 alpha
-- 嵌入式 alpha 只有在确实存在非全 1 覆盖变化时才被视为可用
-- 如果没有可用 mask，GUI 会先提示，再决定是否自动检测边缘连通的无效背景区
-- 预览和统计仍只基于有效分析区域，但最终预览 LUT 应用与全分辨率输出会覆盖整张图像
+- 内部点支持横向和纵向拖动
+- 两端端点的 `x` 锁定在 `0` 和 `1`
+- 内部点 `x` 不能穿过相邻控制点
+- Lightness 会裁剪到 `[0, 1]`
+- Chroma 会裁剪到 `>= 0`
+- Hue 会保持 canonical 值在 `[0, 360)`
 
-导出的 JSON 与当前 `texture_map_toolbox luma --curves ...` / `python -m texture_map_toolbox luma --curves ...` 的输入格式一致，因此可以直接拿来喂当前 CLI 主流程。
+### 3. Key Points 数量控制
 
-如果从 Python 直接集成，建议优先走 [`texture_map_toolbox/api/luma.py`](../texture_map_toolbox/api/luma.py) 而不是兼容脚本路径。
+当前“增减关键点数量”通过每条曲线自己的 Key Points spinbox 完成：
+
+- 变少：把当前生效曲线重采样到更少的 sparse handles
+- 变多：同样按当前生效曲线补采样
+
+这不是“对某个选中点精确插入/删除”的 UI，而是按当前曲线整体重采样。
+
+### 4. Reset to Default
+
+Reset to Default 的语义不是“重采样一遍 sparse handles”，而是：
+
+- 保留当前 visible handle 数量
+- 让该曲线重新回到默认模式
+- 实际状态曲线重新回退到基础模型基线，不再受 sparse handles 控制
+
+### 5. Hue 显示窗口
+
+Hue 曲线本身内部仍存成 canonical 的 `[0, 360)` 角度值，但显示层支持一个“窗口起点”滑块：
+
+- 用户可选择任意 `0-359` 作为显示起点
+- 面板显示范围变成 `[start, start + 360]`
+- 背景、主曲线、默认虚线和控制点都一起映射到这个显示窗口
+- 这只是显示变换，不会改变底层控制点和导出的 JSON
+
+### 6. 目标图导入
+
+Qt 版内置一个目标图对话框，可以一张图分别导入 `L / C / H`：
+
+- `Lt(y)`：读取目标图的 Lightness 样本，并调用 `fit_monotonic_lightness_transfer_curve(...)` 自动生成单调 Lightness 转换曲线，然后重采样到当前 visible point count
+- `Ct(L')`：读取目标图并按当前 point count 采样其 `C(y)` 模型
+- `ht(L')`：读取目标图并按当前 point count 采样其 `h(y)` 模型
+
+这样既支持“一张目标图同时导入多条曲线”，也支持“多张目标图分别喂给不同曲线”。
+
+### 7. Mask 交互
+
+输入图和目标图在没有可用 mask 时，Qt 路径支持三种处理方式：
+
+- 显式加载外部 mask 文件
+- 改用一个或多个 seed 像素生成 connected-region mask
+- Continue Without Extra Mask
+
+connected-region seed mask 当前支持：
+
+- 多 seed 点切换
+- 颜色误差滑块
+- 区域偏移滑块
+- 原图 marker overlay
+- mask preview 面板
+
+旧的 auto-detect border mask 代码仍保留在 core 中，但不再是 Qt 默认交互。
 
 ---
 
 ## 性能观察
 
-在当前实现里，预览主要分成三段：
+当前预览主要分成三段：
 
-1. 构建状态曲线并烘焙 512 项预览 LUT
+1. 构建状态曲线并烘焙预览 LUT
 2. 在缩小图像上执行 LUT 查表
-3. 交给 matplotlib 重绘
+3. Qt / matplotlib 重绘 UI
 
-这轮迁移后的无界面验证中，示例图像的预览阶段大致表现为：
-
-- `state+lut`：约 3 ms
-- `recolor`：约 5 ms
-- `draw`：主要受 matplotlib 后端影响
-
-结论仍然和旧版一致：
+结论仍然比较稳定：
 
 - 曲线求值本身不是瓶颈
 - LUT 查表已经足够快
-- 主要瓶颈仍然是 matplotlib 的绘制和交互调度
+- 主要开销仍在 GUI 重绘和事件调度
 
-如果后续仍要追求更流畅的 120Hz 拖拽体验，优化方向没有变：
-
-1. 更快的绘制路径，例如 blitting
-2. 更快的前端框架，例如 Dear PyGui / PyQt6
-3. 仅在必要时再考虑更激进的数值层优化
+Qt 版本已经避免了 matplotlib 交互时的一部分绘制成本，但仍是当前桌面 MVP，而不是最终形态。
 
 ---
 
 ## 当前限制
 
-1. Chroma / Hue 默认会继承基础模型关键点，因此点数较多，编辑精度高但 UI 会更密。
-2. matplotlib 版本仍然主要依赖命令行传入输入图；Qt 版本已经补上原生文件对话框和启动页。
-3. 当前没有“控制点数量调整”面板，也没有数值输入框。
-4. 当前 Qt 版本仍是 MVP，重点是验证新的桌面交互结构，不是最终形态。
+1. “增加/减少关键点数量”当前是整体重采样，不是对选中点做精确插入/删除。
+2. matplotlib 后端没有补齐 Qt 版本的大部分新交互。
+3. Hue 显示窗口当前显示的是连续窗口值，而不是循环格式化后的 `0-359` 文本刻度。
+4. Qt 版虽然已经可用，但仍然优先保证语义正确和流程统一，而不是追求最终 UI 完整度。
 
 ---
 
 ## 后续方向
 
-1. 增加控制点数量管理和数值输入
-2. 把全分辨率确认和导出结果做成更明确的 UI 控件
-3. 如果交互流畅度仍不够，再迁移到更适合实时交互的 GUI 框架
+1. 增加显式的 Add Point / Remove Point 交互，而不是只依赖 point-count 重采样。
+2. 继续补齐更细的数值输入、批量编辑和更明确的导出/确认 UI。
+3. 如有必要，再进一步优化绘制路径或评估更适合实时交互的 GUI 框架。
