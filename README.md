@@ -145,6 +145,7 @@ Qt 编辑器当前是推荐桌面入口，主要交互包括：
 - 稀疏 Key Points 数量调节
 - 控制点横向/纵向拖动
 - Reset to Default 回到基础模型基线
+- Export Image 导出当前全分辨率结果图像
 - Hue 显示窗口起点滑块
 - 一张目标图按 `L / C / H` 复选框分别导入
 - 输入图和目标图的 mask 选择、connected-region seed preview、多种子 marker、颜色误差和区域偏移调节

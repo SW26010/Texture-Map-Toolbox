@@ -161,9 +161,34 @@ class QtEditorSmokeTests(unittest.TestCase):
         try:
             self.assertEqual(window.windowTitle(), "Texture-Map-Toolbox Qt MVP")
             self.assertEqual(window._preview_buf.shape[-1], 3)
+            self.assertEqual(window.export_image_button.text(), "Export Image")
             self.assertGreater(window.lightness_plot.control_item._positions.shape[0], 1)
             self.assertEqual(window.chroma_plot.control_item._positions.shape[0], STATE_CURVE_CTRL_POINTS)
             self.assertEqual(window.hue_plot.control_item._positions.shape[0], STATE_CURVE_CTRL_POINTS)
+        finally:
+            window.close()
+
+    def test_qt_editor_can_export_full_resolution_image(self):
+        window = build_qt_editor(SAMPLE_IMAGE)
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                output_path = Path(temp_dir) / "exported-preview.png"
+                with mock.patch(
+                    "PySide6.QtWidgets.QFileDialog.getSaveFileName",
+                    return_value=(str(output_path), "PNG Files (*.png)"),
+                ), mock.patch(
+                    "texture_map_toolbox.gui.qt_editor.save_luma_output_image",
+                ) as save_output_image:
+                    window.export_image_button.click()
+                    QtWidgets.QApplication.processEvents()
+
+                save_output_image.assert_called_once()
+                saved_image, saved_path = save_output_image.call_args.args
+                self.assertEqual(saved_path, str(output_path))
+                self.assertEqual(saved_image.dtype, np.uint8)
+                self.assertEqual(saved_image.shape[-1], 3)
+                self.assertEqual(window.output_image_path, str(output_path))
+                self.assertIn("Exported image:", window.status_label.text())
         finally:
             window.close()
 

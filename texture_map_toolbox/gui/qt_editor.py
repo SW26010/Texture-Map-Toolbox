@@ -37,6 +37,7 @@ from texture_map_toolbox.core.luma import (
     prepare_control_points,
     reconstruct_from_state_curves,
     resolve_input_image_path,
+    save_luma_output_image,
 )
 from texture_map_toolbox.gui.luma_plots import plot_comparison
 from texture_map_toolbox.gui.matplotlib_runtime import show_figures
@@ -1550,6 +1551,7 @@ class QtOklchCurveEditorWindow(QtWidgets.QMainWindow):
         self.base_model = base_model
         self.dither_strength = dither_strength
         self.curve_output_path = curve_output_path or self._default_curve_output_path()
+        self.output_image_path = self._default_output_image_path()
         self.source_lightness_samples = self.oklch_float[self.valid_mask, 0]
         self.target_curve_image_paths: dict[str, str] = {}
         self.target_curve_mask_paths: dict[str, str | None] = {}
@@ -1572,6 +1574,10 @@ class QtOklchCurveEditorWindow(QtWidgets.QMainWindow):
     def _default_curve_output_path(self) -> str:
         stem, _ = os.path.splitext(self.image_path)
         return f"{stem}_state_curves.json"
+
+    def _default_output_image_path(self) -> str:
+        stem, _ = os.path.splitext(self.image_path)
+        return f"{stem}_recolored.png"
 
     def _build_preview_inputs(self):
         self.preview_frame = build_luma_preview_frame(
@@ -1921,11 +1927,13 @@ class QtOklchCurveEditorWindow(QtWidgets.QMainWindow):
 
         action_layout = QtWidgets.QHBoxLayout()
         self.save_button = QtWidgets.QPushButton("Save Curves JSON")
+        self.export_image_button = QtWidgets.QPushButton("Export Image")
         self.render_button = QtWidgets.QPushButton("Full-Resolution Render")
         self.load_target_picker_button = QtWidgets.QPushButton("Load L/C/H Target")
         self.status_label = QtWidgets.QLabel("Ready")
         self.status_label.setStyleSheet("color: #ddd;")
         action_layout.addWidget(self.save_button)
+        action_layout.addWidget(self.export_image_button)
         action_layout.addWidget(self.render_button)
         action_layout.addWidget(self.load_target_picker_button)
         action_layout.addWidget(self.status_label, 1)
@@ -2011,6 +2019,7 @@ class QtOklchCurveEditorWindow(QtWidgets.QMainWindow):
             lambda positions: self._on_curve_points_changed(2, positions)
         )
         self.save_button.clicked.connect(self._save_curves)
+        self.export_image_button.clicked.connect(self._export_full_resolution_image)
         self.render_button.clicked.connect(self._render_full_resolution)
         self.load_target_picker_button.clicked.connect(self._open_target_image_picker)
 
@@ -2345,8 +2354,8 @@ class QtOklchCurveEditorWindow(QtWidgets.QMainWindow):
             handle.write("\n")
         self.status_label.setText(f"Saved curves: {self.curve_output_path}")
 
-    def _render_full_resolution(self):
-        """Run the original full-resolution reconstruction and display comparison plots."""
+    def _compute_full_resolution_render(self):
+        """Run the shared full-resolution reconstruction used by render and export."""
         state_curves = self._last_state_curves or self._build_state_curves()
         recolored_rgb_float, _, y_eval, gamut_pixels = reconstruct_from_state_curves(
             self.oklch_float,
@@ -2359,6 +2368,42 @@ class QtOklchCurveEditorWindow(QtWidgets.QMainWindow):
             recolored_rgb_float,
             self.valid_mask,
         )
+        return recolored_rgb_int, y_eval, gamut_pixels, psnr, delta_e_image, delta_e_stats
+
+    def _select_output_image_path(self) -> str | None:
+        selected_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Export recolored image",
+            self.output_image_path,
+            "PNG Files (*.png);;JPEG Files (*.jpg *.jpeg);;BMP Files (*.bmp);;TIFF Files (*.tif *.tiff);;WebP Files (*.webp);;All Files (*)",
+        )
+        if not selected_path:
+            return None
+        self.output_image_path = selected_path
+        return selected_path
+
+    def _export_full_resolution_image(self):
+        """Render the current state curves at full resolution and save the output image."""
+        output_path = self._select_output_image_path()
+        if output_path is None:
+            self.status_label.setText("Image export canceled")
+            return
+
+        try:
+            recolored_rgb_int, _, gamut_pixels, psnr, _, delta_e_stats = self._compute_full_resolution_render()
+            save_luma_output_image(recolored_rgb_int, output_path)
+        except Exception as exc:  # noqa: BLE001
+            self._show_error("Export Image Failed", str(exc))
+            return
+
+        self.status_label.setText(
+            "Exported image: {}  gamut={}  PSNR={:.2f} dB  DeltaE mean={:.2f}"
+            .format(output_path, gamut_pixels, psnr, delta_e_stats["mean"])
+        )
+
+    def _render_full_resolution(self):
+        """Run the original full-resolution reconstruction and display comparison plots."""
+        recolored_rgb_int, y_eval, gamut_pixels, psnr, delta_e_image, delta_e_stats = self._compute_full_resolution_render()
         plot_comparison(self.rgb_float, y_eval, recolored_rgb_int, self.valid_mask, psnr, delta_e_image)
         show_figures(block=False)
         self.status_label.setText(
