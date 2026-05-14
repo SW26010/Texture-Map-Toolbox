@@ -72,6 +72,7 @@ class QtEditorSmokeTests(unittest.TestCase):
             plot._curve_item,
             plot._default_curve_item,
             plot._hist_item,
+            plot._baseline_hist_item,
             plot._reference_hist_item,
         ]
         visibility = [item.isVisible() for item in overlay_items]

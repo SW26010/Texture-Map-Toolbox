@@ -1418,7 +1418,7 @@ class DraggableCurveGraph(pg.GraphItem):
 
 
 class CurvePlotWidget(pg.PlotWidget):
-    """Single-channel plot with background, line, histogram, and draggable points."""
+    """Single-channel plot with background, curve overlays, histograms, and draggable points."""
 
     def __init__(
         self,
@@ -1456,6 +1456,12 @@ class CurvePlotWidget(pg.PlotWidget):
         )
         self._hist_item.setZValue(-5)
         self.addItem(self._hist_item)
+
+        self._baseline_hist_item = pg.PlotDataItem(
+            pen=pg.mkPen("#b0b0b0", width=1.0, style=QtCore.Qt.PenStyle.DashLine),
+        )
+        self._baseline_hist_item.setZValue(-4.5)
+        self.addItem(self._baseline_hist_item)
 
         self._reference_hist_item = pg.PlotDataItem(
             pen=pg.mkPen("#7cf27c", width=1.5),
@@ -1515,6 +1521,13 @@ class CurvePlotWidget(pg.PlotWidget):
             return
         self._hist_item.setData(x_values, y_values)
 
+    def set_baseline_histogram(self, x_values: np.ndarray | None, y_values: np.ndarray | None):
+        """Update the dashed baseline histogram overlay."""
+        if x_values is None or y_values is None:
+            self._baseline_hist_item.setData([], [])
+            return
+        self._baseline_hist_item.setData(x_values, y_values)
+
     def set_reference_histogram(self, x_values: np.ndarray | None, y_values: np.ndarray | None):
         """Update an optional reference histogram overlay."""
         if x_values is None or y_values is None:
@@ -1552,6 +1565,7 @@ class QtOklchCurveEditorWindow(QtWidgets.QMainWindow):
         self.target_curve_image_paths: dict[str, str] = {}
         self.target_curve_mask_paths: dict[str, str | None] = {}
         self._lightness_reference_histogram: tuple[np.ndarray, np.ndarray] | None = None
+        self._lightness_baseline_histogram = self._build_lightness_histogram(self.source_lightness_samples)
         self._last_target_image_dialog_path = self.image_path
         self._last_target_mask_dialog_path: str | None = None
         self._last_target_mask_mode = "interactive-seed"
@@ -2311,6 +2325,7 @@ class QtOklchCurveEditorWindow(QtWidgets.QMainWindow):
         self.lightness_plot.set_curve_line(lightness_line)
         self.lightness_plot.set_control_points(self.ctrl_x[0], self.ctrl_y[0])
         self.lightness_plot.set_histogram(hist_x, hist_y)
+        self.lightness_plot.set_baseline_histogram(*self._lightness_baseline_histogram)
         if self._lightness_reference_histogram is None:
             self.lightness_plot.set_reference_histogram(None, None)
         else:

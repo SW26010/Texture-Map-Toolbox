@@ -6,12 +6,12 @@ from unittest import mock
 
 import numpy as np
 from PIL import Image
-from PySide6 import QtWidgets
+from PySide6 import QtCore, QtWidgets
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from texture_map_toolbox.api.luma import LumaExecutionRequest, load_image_data, run_luma_workflow
-from texture_map_toolbox.gui.qt_editor import launch_qt_editor
+from texture_map_toolbox.gui.qt_editor import build_qt_editor, launch_qt_editor
 
 
 class AlphaInputValidationTests(unittest.TestCase):
@@ -142,6 +142,25 @@ class AlphaInputValidationTests(unittest.TestCase):
             self.assertFalse(expanded_image.valid_mask[2, 2])
             self.assertTrue(expanded_image.valid_mask[4, 4])
             self.assertTrue(shrunk_image.valid_mask.all())
+
+    def test_qt_editor_lightness_plot_shows_dashed_source_histogram_reference(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "source.png"
+            self._write_rgb_image(image_path, suffix=".png")
+
+            window = build_qt_editor(str(image_path))
+            try:
+                baseline_x, baseline_y = window.lightness_plot._baseline_hist_item.getData()
+                self.assertIsNotNone(baseline_x)
+                self.assertIsNotNone(baseline_y)
+                self.assertGreater(np.asarray(baseline_x).size, 0)
+                self.assertGreater(np.asarray(baseline_y).size, 0)
+                self.assertEqual(
+                    window.lightness_plot._baseline_hist_item.opts["pen"].style(),
+                    QtCore.Qt.PenStyle.DashLine,
+                )
+            finally:
+                window.close()
 
     def test_external_alpha_mask_overrides_embedded_alpha(self):
         with tempfile.TemporaryDirectory() as temp_dir:

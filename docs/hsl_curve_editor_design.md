@@ -105,7 +105,7 @@ Qt 版本通过按钮触发一次完整重建，并弹出对比图；matplotlib 
 
 其中：
 
-- `Lt(y)` 面板叠加当前输出 Lightness 直方图和可选 target 参考直方图
+- `Lt(y)` 面板叠加当前输出 Lightness 直方图、原图 Lightness 虚线直方图，以及可选 target 参考直方图
 - `Ct(L')` 和 `ht(L')` 面板使用动态色彩背景
 
 ### 2. 控制点拖拽

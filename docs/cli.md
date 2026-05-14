@@ -122,7 +122,7 @@ python -m texture_map_toolbox editor --backend qt
 - 每条曲线独立的 Key Points 数量调节
 - 每条曲线独立的 Reset to Default
 - Export Image 按钮，可直接导出当前全分辨率重建结果
-- `Lt(y)` 灰度背景与输出 Lightness 直方图叠加
+- `Lt(y)` 灰度背景与输出 Lightness 直方图叠加，并显示原图 Lightness 的虚线直方图参考
 - `Ct(L')` / `ht(L')` 动态色彩背景
 - 内置目标图选择器，一张图可用复选框分别导入 `L / C / H`
 - Hue 显示窗口起点滑块，可把显示范围设为任意 `[start, start + 360]`
