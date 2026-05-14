@@ -31,6 +31,7 @@ JPEG_IMAGE_SUFFIXES = (".jpg", ".jpeg")
 ALPHA_VALID_EPSILON = 1e-6
 AUTO_MASK_BORDER_WIDTH = 2
 AUTO_MASK_COLOR_TOLERANCE = 6
+DEFAULT_SEED_MASK_COLOR_TOLERANCE = 0
 AUTO_MASK_HISTOGRAM_BIN_SIZE = 8
 AUTO_MASK_MAX_BORDER_STD = 6.0
 AUTO_MASK_MIN_EDGE_RUN = 3
@@ -454,7 +455,7 @@ def detect_seeded_valid_mask(
     rgb_float: np.ndarray,
     seed_point: tuple[int, int] | list[tuple[int, int]] | tuple[tuple[int, int], ...],
     *,
-    color_tolerance: int = AUTO_MASK_COLOR_TOLERANCE,
+    color_tolerance: int = DEFAULT_SEED_MASK_COLOR_TOLERANCE,
     region_offset_pixels: int = 0,
 ) -> np.ndarray:
     """Return a valid-pixel mask by flood-filling from one or more user-selected seed pixels."""
@@ -613,7 +614,7 @@ def load_image_data(
     alpha_mask_path: str | None = None,
     mask_seed_points: list[tuple[int, int]] | tuple[tuple[int, int], ...] | None = None,
     mask_seed_point: tuple[int, int] | None = None,
-    mask_color_tolerance: int = AUTO_MASK_COLOR_TOLERANCE,
+    mask_color_tolerance: int = DEFAULT_SEED_MASK_COLOR_TOLERANCE,
     mask_region_offset: int = 0,
     auto_detect_mask: bool = False,
 ) -> LoadedImageData:
@@ -692,7 +693,7 @@ def load_image(
     alpha_mask_path: str | None = None,
     mask_seed_points: list[tuple[int, int]] | tuple[tuple[int, int], ...] | None = None,
     mask_seed_point: tuple[int, int] | None = None,
-    mask_color_tolerance: int = AUTO_MASK_COLOR_TOLERANCE,
+    mask_color_tolerance: int = DEFAULT_SEED_MASK_COLOR_TOLERANCE,
     mask_region_offset: int = 0,
     auto_detect_mask: bool = False,
 ):
@@ -1498,6 +1499,7 @@ __all__ = [
     "AUTO_MASK_BORDER_WIDTH",
     "AUTO_MASK_COLOR_TOLERANCE",
     "DATA_DIRECTORY",
+    "DEFAULT_SEED_MASK_COLOR_TOLERANCE",
     "DEFAULT_FAST_LUT_SIZE",
     "DEFAULT_FAST_PREVIEW_SCALE",
     "DEFAULT_SAMPLE_IMAGE_CANDIDATES",

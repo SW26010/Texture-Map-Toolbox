@@ -13,9 +13,9 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from scipy.interpolate import PchipInterpolator
 
 from texture_map_toolbox.core.luma import (
-    AUTO_MASK_COLOR_TOLERANCE,
     DEFAULT_FAST_LUT_SIZE,
     DEFAULT_FAST_PREVIEW_SCALE,
+    DEFAULT_SEED_MASK_COLOR_TOLERANCE,
     DITHER_STRENGTH,
     LoadedImageData,
     OklchCurveModel,
@@ -220,21 +220,20 @@ class InteractiveSeedMaskControls(QtWidgets.QGroupBox):
         self.seed_summary_label.setStyleSheet("color: #cccccc;")
         layout.addWidget(self.seed_summary_label)
 
-        self.color_tolerance_slider, self.color_tolerance_value_label = self._build_slider_row(
+        self.color_tolerance_spinbox = self._build_spinbox_row(
             layout,
             label_text="Color Tolerance",
             minimum=0,
             maximum=MASK_COLOR_TOLERANCE_MAX,
-            value=AUTO_MASK_COLOR_TOLERANCE,
-            formatter=lambda value: str(int(value)),
+            value=DEFAULT_SEED_MASK_COLOR_TOLERANCE,
         )
-        self.region_offset_slider, self.region_offset_value_label = self._build_slider_row(
+        self.region_offset_spinbox = self._build_spinbox_row(
             layout,
             label_text="Region Offset",
             minimum=MASK_REGION_OFFSET_MIN,
             maximum=MASK_REGION_OFFSET_MAX,
             value=0,
-            formatter=lambda value: f"{int(value):+d} px",
+            suffix=" px",
         )
 
         button_row = QtWidgets.QHBoxLayout()
@@ -244,11 +243,11 @@ class InteractiveSeedMaskControls(QtWidgets.QGroupBox):
         button_row.addWidget(self.clear_seeds_button)
         layout.addLayout(button_row)
 
-        self.color_tolerance_slider.valueChanged.connect(self.values_changed)
-        self.region_offset_slider.valueChanged.connect(self.values_changed)
+        self.color_tolerance_spinbox.valueChanged.connect(self.values_changed)
+        self.region_offset_spinbox.valueChanged.connect(self.values_changed)
         self.set_seed_points(())
 
-    def _build_slider_row(
+    def _build_spinbox_row(
         self,
         layout: QtWidgets.QVBoxLayout,
         *,
@@ -256,37 +255,34 @@ class InteractiveSeedMaskControls(QtWidgets.QGroupBox):
         minimum: int,
         maximum: int,
         value: int,
-        formatter,
-    ) -> tuple[QtWidgets.QSlider, QtWidgets.QLabel]:
+        suffix: str = "",
+    ) -> QtWidgets.QSpinBox:
         row_layout = QtWidgets.QGridLayout()
         row_layout.setHorizontalSpacing(8)
         row_layout.setVerticalSpacing(4)
+        row_layout.setColumnStretch(1, 1)
 
         label = QtWidgets.QLabel(label_text)
-        slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
-        slider.setRange(int(minimum), int(maximum))
-        slider.setValue(int(value))
-        value_label = QtWidgets.QLabel()
-        value_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
-        value_label.setMinimumWidth(64)
-
-        def _update_value_label(slider_value: int):
-            value_label.setText(formatter(slider_value))
-
-        slider.valueChanged.connect(_update_value_label)
-        _update_value_label(slider.value())
+        spinbox = QtWidgets.QSpinBox()
+        spinbox.setRange(int(minimum), int(maximum))
+        spinbox.setValue(int(value))
+        spinbox.setSingleStep(1)
+        spinbox.setAccelerated(True)
+        spinbox.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+        spinbox.setMinimumWidth(96)
+        if suffix:
+            spinbox.setSuffix(suffix)
 
         row_layout.addWidget(label, 0, 0)
-        row_layout.addWidget(slider, 0, 1)
-        row_layout.addWidget(value_label, 0, 2)
+        row_layout.addWidget(spinbox, 0, 2)
         layout.addLayout(row_layout)
-        return slider, value_label
+        return spinbox
 
     def color_tolerance(self) -> int:
-        return int(self.color_tolerance_slider.value())
+        return int(self.color_tolerance_spinbox.value())
 
     def region_offset(self) -> int:
-        return int(self.region_offset_slider.value())
+        return int(self.region_offset_spinbox.value())
 
     def set_seed_points(self, seed_points: tuple[tuple[int, int], ...] | list[tuple[int, int]]):
         self._seed_points = tuple((int(row), int(column)) for row, column in seed_points)
@@ -465,7 +461,7 @@ class QtTargetImagePickerDialog(QtWidgets.QDialog):
         self._refresh_previews()
 
     def _set_initial_mask_mode(self, initial_mask_mode: str | None):
-        mask_mode = initial_mask_mode or ("external" if self.mask_path_edit.text().strip() else "image-alpha")
+        mask_mode = initial_mask_mode or ("external" if self.mask_path_edit.text().strip() else "interactive-seed")
         if mask_mode == "external":
             self.load_mask_radio.setChecked(True)
         elif mask_mode == "interactive-seed":
@@ -510,7 +506,7 @@ class QtTargetImagePickerDialog(QtWidgets.QDialog):
 
     def _clear_mask(self):
         self.mask_path_edit.clear()
-        self.use_image_alpha_radio.setChecked(True)
+        self.pick_region_radio.setChecked(True)
 
     def _refresh_previews(self):
         self._refresh_image_preview()
@@ -1558,7 +1554,7 @@ class QtOklchCurveEditorWindow(QtWidgets.QMainWindow):
         self._lightness_reference_histogram: tuple[np.ndarray, np.ndarray] | None = None
         self._last_target_image_dialog_path = self.image_path
         self._last_target_mask_dialog_path: str | None = None
-        self._last_target_mask_mode = "image-alpha"
+        self._last_target_mask_mode = "interactive-seed"
         self._default_curve_lines = self._build_default_curve_lines()
         self.hue_display_start = float(HUE_DISPLAY_START_MIN)
         self.hue_display_start_slider: QtWidgets.QSlider | None = None
@@ -2050,7 +2046,7 @@ class QtOklchCurveEditorWindow(QtWidgets.QMainWindow):
         alpha_mask_path: str | None = None,
         mask_seed_points: list[tuple[int, int]] | tuple[tuple[int, int], ...] | None = None,
         mask_seed_point: tuple[int, int] | None = None,
-        mask_color_tolerance: int = AUTO_MASK_COLOR_TOLERANCE,
+        mask_color_tolerance: int = DEFAULT_SEED_MASK_COLOR_TOLERANCE,
         mask_region_offset: int = 0,
         show_warnings: bool = True,
     ) -> tuple[LoadedImageData, OklchCurveModel, np.ndarray]:
@@ -2105,7 +2101,7 @@ class QtOklchCurveEditorWindow(QtWidgets.QMainWindow):
         alpha_mask_path: str | None = None,
         mask_seed_points: list[tuple[int, int]] | tuple[tuple[int, int], ...] | None = None,
         mask_seed_point: tuple[int, int] | None = None,
-        mask_color_tolerance: int = AUTO_MASK_COLOR_TOLERANCE,
+        mask_color_tolerance: int = DEFAULT_SEED_MASK_COLOR_TOLERANCE,
         mask_region_offset: int = 0,
         apply_lightness: bool,
         apply_chroma: bool,
@@ -2434,7 +2430,7 @@ class QtEditorLauncherWindow(QtWidgets.QWidget):
         self.alpha_mask_path_edit.setText(alpha_mask_path or "")
         self.curve_path_edit.setText(curve_path or "")
         self.curve_output_path_edit.setText(curve_output_path or "")
-        self._set_initial_mask_mode("external" if alpha_mask_path else "image-alpha")
+        self._set_initial_mask_mode("external" if alpha_mask_path else "interactive-seed")
         self._refresh_previews()
 
     def _build_ui(self):
@@ -2665,7 +2661,7 @@ class QtEditorLauncherWindow(QtWidgets.QWidget):
 
     def _clear_alpha_mask(self):
         self.alpha_mask_path_edit.clear()
-        self.use_image_alpha_radio.setChecked(True)
+        self.pick_region_radio.setChecked(True)
 
     def _refresh_previews(self):
         self._refresh_image_preview()
@@ -2943,7 +2939,7 @@ def build_qt_editor(
     alpha_mask_path: str | None = None,
     mask_seed_points: list[tuple[int, int]] | tuple[tuple[int, int], ...] | None = None,
     mask_seed_point: tuple[int, int] | None = None,
-    mask_color_tolerance: int = AUTO_MASK_COLOR_TOLERANCE,
+    mask_color_tolerance: int = DEFAULT_SEED_MASK_COLOR_TOLERANCE,
     mask_region_offset: int = 0,
     curve_path: str | None = None,
     curve_output_path: str | None = None,
@@ -3010,7 +3006,7 @@ def launch_qt_editor(
     alpha_mask_path: str | None = None,
     mask_seed_points: list[tuple[int, int]] | tuple[tuple[int, int], ...] | None = None,
     mask_seed_point: tuple[int, int] | None = None,
-    mask_color_tolerance: int = AUTO_MASK_COLOR_TOLERANCE,
+    mask_color_tolerance: int = DEFAULT_SEED_MASK_COLOR_TOLERANCE,
     mask_region_offset: int = 0,
     curve_path: str | None = None,
     curve_output_path: str | None = None,

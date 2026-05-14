@@ -128,7 +128,11 @@ class QtEditorSmokeTests(unittest.TestCase):
         launcher = build_qt_editor_launcher()
         try:
             self.assertEqual(launcher.windowTitle(), "Texture-Map-Toolbox Launcher")
+            self.assertTrue(launcher.pick_region_radio.isChecked())
+            self.assertEqual(launcher.seed_mask_controls.color_tolerance(), 0)
+            self.assertEqual(launcher.seed_mask_controls.region_offset(), 0)
             launcher.image_path_edit.setText(SAMPLE_IMAGE)
+            launcher.use_image_alpha_radio.setChecked(True)
             editor_window = launcher.launch_selected_editor(show_window=False)
             self.assertIsNotNone(editor_window)
             try:
@@ -148,6 +152,7 @@ class QtEditorSmokeTests(unittest.TestCase):
             editor_window = None
             try:
                 launcher.show()
+                launcher.use_image_alpha_radio.setChecked(True)
                 editor_window = launcher.launch_selected_editor(show_window=True)
                 self.assertIsNotNone(editor_window)
                 self.assertFalse(launcher.isVisible())
@@ -443,7 +448,17 @@ class QtEditorSmokeTests(unittest.TestCase):
             finally:
                 dialog.close()
 
-    def test_qt_target_picker_seed_mode_supports_multiple_seeds_and_sliders(self):
+    def test_qt_target_picker_defaults_to_pick_region_with_zero_mask_inputs(self):
+        _ensure_qt_application()
+        dialog = QtTargetImagePickerDialog(None)
+        try:
+            self.assertTrue(dialog.pick_region_radio.isChecked())
+            self.assertEqual(dialog.selected_mask_color_tolerance(), 0)
+            self.assertEqual(dialog.selected_mask_region_offset(), 0)
+        finally:
+            dialog.close()
+
+    def test_qt_target_picker_seed_mode_supports_multiple_seeds_and_numeric_mask_inputs(self):
         _ensure_qt_application()
         with tempfile.TemporaryDirectory() as temp_dir:
             image_path = Path(temp_dir) / "multi-seed-mask-source.png"
@@ -455,8 +470,10 @@ class QtEditorSmokeTests(unittest.TestCase):
                 initial_mask_mode="interactive-seed",
             )
             try:
-                dialog.seed_mask_controls.color_tolerance_slider.setValue(0)
-                dialog.seed_mask_controls.region_offset_slider.setValue(1)
+                self.assertIsInstance(dialog.seed_mask_controls.color_tolerance_spinbox, QtWidgets.QSpinBox)
+                dialog.seed_mask_controls.color_tolerance_spinbox.setValue(0)
+                self.assertIsInstance(dialog.seed_mask_controls.region_offset_spinbox, QtWidgets.QSpinBox)
+                dialog.seed_mask_controls.region_offset_spinbox.setValue(1)
                 dialog._handle_image_preview_click(0, 0)
                 dialog._handle_image_preview_click(0, 7)
 
@@ -535,8 +552,8 @@ class QtEditorSmokeTests(unittest.TestCase):
             editor_window = None
             try:
                 launcher.pick_region_radio.setChecked(True)
-                launcher.seed_mask_controls.color_tolerance_slider.setValue(0)
-                launcher.seed_mask_controls.region_offset_slider.setValue(1)
+                launcher.seed_mask_controls.color_tolerance_spinbox.setValue(0)
+                launcher.seed_mask_controls.region_offset_spinbox.setValue(1)
                 launcher._handle_image_preview_click(0, 0)
                 launcher._handle_image_preview_click(0, 7)
                 self.assertIn("connected-region", launcher.mask_preview_info_label.text())
