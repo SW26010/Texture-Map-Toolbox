@@ -13,8 +13,9 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from texture_map_toolbox import __main__ as package_main
 from texture_map_toolbox.api.luma import resolve_input_image_path
 from texture_map_toolbox.cli import editor as editor_cli
-from texture_map_toolbox.core.luma import STATE_CURVE_CTRL_POINTS
+from texture_map_toolbox.core.luma import LumaImageExportOptions, STATE_CURVE_CTRL_POINTS
 from texture_map_toolbox.gui.qt_editor import (
+    QtImageExportDialog,
     QtTargetImagePickerDialog,
     _ensure_qt_application,
     build_qt_editor,
@@ -22,7 +23,24 @@ from texture_map_toolbox.gui.qt_editor import (
 )
 
 
-SAMPLE_IMAGE = resolve_input_image_path(None)
+def _build_fallback_sample_image() -> tuple[str, tempfile.TemporaryDirectory | None]:
+    try:
+        return resolve_input_image_path(None), None
+    except ValueError:
+        temp_dir = tempfile.TemporaryDirectory()
+        sample_path = Path(temp_dir.name) / "sample.png"
+        sample_rgb = np.array(
+            [
+                [[255, 32, 32], [32, 255, 32], [32, 32, 255]],
+                [[255, 255, 32], [255, 32, 255], [32, 255, 255]],
+            ],
+            dtype=np.uint8,
+        )
+        Image.fromarray(sample_rgb, mode="RGB").save(sample_path)
+        return str(sample_path), temp_dir
+
+
+SAMPLE_IMAGE, _SAMPLE_IMAGE_TEMP_DIR = _build_fallback_sample_image()
 
 
 class QtEditorSmokeTests(unittest.TestCase):
@@ -179,9 +197,14 @@ class QtEditorSmokeTests(unittest.TestCase):
         try:
             with tempfile.TemporaryDirectory() as temp_dir:
                 output_path = Path(temp_dir) / "exported-preview.png"
+                dialog = mock.Mock(spec=QtImageExportDialog)
+                dialog.exec.return_value = QtWidgets.QDialog.DialogCode.Accepted
+                dialog.selected_output_path.return_value = str(output_path)
+                dialog.selected_export_options.return_value = LumaImageExportOptions(format_name="png")
+                dialog.selected_dither_strength.return_value = 0.0
                 with mock.patch(
-                    "PySide6.QtWidgets.QFileDialog.getSaveFileName",
-                    return_value=(str(output_path), "PNG Files (*.png)"),
+                    "texture_map_toolbox.gui.qt_editor.QtImageExportDialog",
+                    return_value=dialog,
                 ), mock.patch(
                     "texture_map_toolbox.gui.qt_editor.save_luma_output_image",
                 ) as save_output_image:
@@ -191,7 +214,6 @@ class QtEditorSmokeTests(unittest.TestCase):
                 save_output_image.assert_called_once()
                 saved_image, saved_path = save_output_image.call_args.args
                 self.assertEqual(saved_path, str(output_path))
-                self.assertEqual(saved_image.dtype, np.uint8)
                 self.assertEqual(saved_image.shape[-1], 3)
                 self.assertEqual(window.output_image_path, str(output_path))
                 self.assertIn("Exported image:", window.status_label.text())

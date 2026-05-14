@@ -29,6 +29,19 @@ DEFAULT_SAMPLE_IMAGE_CANDIDATES = (
     DATA_DIRECTORY / "mtmtPonyTail_custom.png",
     DATA_DIRECTORY / "mtmtPonyTail.png",
 )
+IMAGE_EXPORT_FORMATS = ("png", "jpeg", "bmp", "tiff", "webp")
+IMAGE_EXPORT_FORMAT_SUFFIXES = {
+    "png": ".png",
+    "jpeg": ".jpg",
+    "bmp": ".bmp",
+    "tiff": ".tiff",
+    "webp": ".webp",
+}
+IMAGE_EXPORT_16BIT_FORMATS = frozenset({"png", "tiff"})
+IMAGE_EXPORT_ALPHA_FORMATS = frozenset({"png", "tiff", "webp"})
+IMAGE_EXPORT_COLOR_SPACES = ("srgb", "linear-srgb")
+IMAGE_EXPORT_OUTPUT_MODES = ("color", "lightness-grayscale")
+IMAGE_EXPORT_ALPHA_MODES = ("source-alpha", "current-mask")
 SUPPORTED_IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp")
 JPEG_IMAGE_SUFFIXES = (".jpg", ".jpeg")
 ALPHA_VALID_EPSILON = 1e-6
@@ -138,6 +151,15 @@ class StateCurveSet:
     hue_v_interp: PchipInterpolator
 
 
+@dataclass(frozen=True)
+class LumaImageExportOptions:
+    format_name: str = "png"
+    bit_depth: int = 8
+    color_space: str = "srgb"
+    output_mode: str = "color"
+    alpha_mode: str = "source-alpha"
+
+
 @dataclass
 class LumaExecutionRequest:
     image_path: str | None = None
@@ -168,6 +190,7 @@ class LoadedImageData:
     alpha_mask_path: str | None
     rgb_float: np.ndarray
     alpha_float: np.ndarray
+    embedded_alpha_float: np.ndarray
     oklch_float: np.ndarray
     valid_mask: np.ndarray
     input_dtype: str
@@ -716,6 +739,7 @@ def load_image_data(
         alpha_mask_path=resolved_alpha_mask_path,
         rgb_float=rgb_float,
         alpha_float=alpha_float,
+        embedded_alpha_float=np.asarray(embedded_alpha, dtype=np.float64),
         oklch_float=oklch_float,
         valid_mask=valid_mask,
         input_dtype=input_dtype,
@@ -845,9 +869,166 @@ def quantize_rgb_image(rgb_float: np.ndarray, valid_mask: np.ndarray | None = No
     return rgb_uint8
 
 
-def save_luma_output_image(output_image: np.ndarray, output_path: str):
+def infer_luma_image_export_format(output_path: str) -> str:
+    """Infer the export format from the output path suffix."""
+    suffix = Path(output_path).suffix.lower()
+    suffix_to_format = {
+        ".png": "png",
+        ".jpg": "jpeg",
+        ".jpeg": "jpeg",
+        ".bmp": "bmp",
+        ".tif": "tiff",
+        ".tiff": "tiff",
+        ".webp": "webp",
+    }
+    if suffix not in suffix_to_format:
+        supported = ", ".join(sorted(SUPPORTED_IMAGE_SUFFIXES))
+        raise ValueError(f"output image path must use one of the supported suffixes: {supported}")
+    return suffix_to_format[suffix]
+
+
+def normalize_luma_image_export_options(
+    export_options: LumaImageExportOptions | None,
+    *,
+    output_path: str | None = None,
+) -> LumaImageExportOptions:
+    """Normalize and validate export options shared by the GUI and CLI."""
+    if export_options is None:
+        inferred_format = "png" if output_path is None else infer_luma_image_export_format(output_path)
+        return LumaImageExportOptions(format_name=inferred_format)
+
+    format_name = str(export_options.format_name or "").strip().lower()
+    if format_name in {"jpg", "jpeg"}:
+        format_name = "jpeg"
+    elif format_name in {"tif", "tiff"}:
+        format_name = "tiff"
+    elif not format_name:
+        format_name = "png" if output_path is None else infer_luma_image_export_format(output_path)
+
+    if format_name not in IMAGE_EXPORT_FORMATS:
+        raise ValueError(f"format_name must be one of {IMAGE_EXPORT_FORMATS}")
+
+    bit_depth = int(export_options.bit_depth)
+    if bit_depth not in {8, 16}:
+        raise ValueError("bit_depth must be 8 or 16")
+    if bit_depth == 16 and format_name not in IMAGE_EXPORT_16BIT_FORMATS:
+        raise ValueError("16-bit export is only supported for PNG and TIFF")
+
+    color_space = str(export_options.color_space or "").strip().lower() or "srgb"
+    if color_space not in IMAGE_EXPORT_COLOR_SPACES:
+        raise ValueError(f"color_space must be one of {IMAGE_EXPORT_COLOR_SPACES}")
+
+    output_mode = str(export_options.output_mode or "").strip().lower() or "color"
+    if output_mode not in IMAGE_EXPORT_OUTPUT_MODES:
+        raise ValueError(f"output_mode must be one of {IMAGE_EXPORT_OUTPUT_MODES}")
+    if bit_depth == 16 and output_mode != "lightness-grayscale":
+        raise ValueError("16-bit export is currently only supported for single-channel L grayscale output")
+
+    alpha_mode = str(export_options.alpha_mode or "").strip().lower() or "source-alpha"
+    if alpha_mode not in IMAGE_EXPORT_ALPHA_MODES:
+        raise ValueError(f"alpha_mode must be one of {IMAGE_EXPORT_ALPHA_MODES}")
+
+    return LumaImageExportOptions(
+        format_name=format_name,
+        bit_depth=bit_depth,
+        color_space=color_space,
+        output_mode=output_mode,
+        alpha_mode=alpha_mode,
+    )
+
+
+def normalize_luma_export_output_path(output_path: str, export_options: LumaImageExportOptions | None = None) -> str:
+    """Return an output path whose suffix matches the selected export format."""
+    normalized_options = normalize_luma_image_export_options(export_options, output_path=output_path)
+    normalized_path = Path(output_path).expanduser()
+    return str(normalized_path.with_suffix(IMAGE_EXPORT_FORMAT_SUFFIXES[normalized_options.format_name]))
+
+
+def _float_image_to_export_codes(image_float: np.ndarray, bit_depth: int) -> np.ndarray:
+    """Quantize a float image into 8-bit or 16-bit integer code values."""
+    image_float = np.clip(np.asarray(image_float, dtype=np.float64), 0.0, 1.0)
+    if bit_depth == 8:
+        return np.round(image_float * 255.0).astype(np.uint8)
+    if bit_depth == 16:
+        return np.round(image_float * 65535.0).astype(np.uint16)
+    raise ValueError("bit_depth must be 8 or 16")
+
+
+def _resolve_export_alpha_plane(
+    image_shape: tuple[int, ...],
+    export_options: LumaImageExportOptions,
+    source_alpha_float: np.ndarray | None,
+    current_mask: np.ndarray | None,
+) -> np.ndarray | None:
+    """Resolve the alpha plane for formats that can store transparency."""
+    if export_options.format_name not in IMAGE_EXPORT_ALPHA_FORMATS or export_options.bit_depth == 16:
+        return None
+
+    if export_options.alpha_mode == "current-mask":
+        if current_mask is None:
+            return None
+        alpha_float = np.asarray(current_mask, dtype=np.float64)
+    elif source_alpha_float is not None:
+        alpha_float = np.asarray(source_alpha_float, dtype=np.float64)
+    elif current_mask is not None:
+        alpha_float = np.ones_like(np.asarray(current_mask, dtype=np.float64), dtype=np.float64)
+    else:
+        return None
+
+    if alpha_float.shape != tuple(image_shape[:2]):
+        raise ValueError("alpha export plane must match the image height and width")
+    return np.clip(alpha_float, 0.0, 1.0)
+
+
+def _resolve_export_lightness_image(output_image: np.ndarray, lightness_image: np.ndarray | None) -> np.ndarray:
+    """Resolve a single-channel Oklch lightness plane for grayscale exports."""
+    if lightness_image is not None:
+        return np.clip(np.asarray(lightness_image, dtype=np.float64), 0.0, 1.0)
+
+    output_array = np.asarray(output_image)
+    if output_array.ndim == 2:
+        return np.clip(img_as_float(output_array), 0.0, 1.0)
+    if output_array.ndim == 3 and output_array.shape[2] >= 3:
+        return np.clip(rgb_to_oklch(img_as_float(output_array))[..., 0], 0.0, 1.0)
+    raise ValueError("grayscale export requires either lightness_image or an RGB/grayscale output_image")
+
+
+def _resolve_export_color_image(output_image: np.ndarray, export_options: LumaImageExportOptions) -> np.ndarray:
+    """Resolve an RGB float image for color exports and optional linear transfer."""
+    output_array = np.asarray(output_image)
+    if output_array.ndim != 3 or output_array.shape[2] < 3:
+        raise ValueError("color export requires an RGB image")
+
+    color_float = np.clip(img_as_float(output_array[..., :3]), 0.0, 1.0)
+    if export_options.color_space == "linear-srgb":
+        return np.clip(srgb_to_linear(color_float), 0.0, 1.0)
+    return color_float
+
+
+def save_luma_output_image(
+    output_image: np.ndarray,
+    output_path: str,
+    *,
+    export_options: LumaImageExportOptions | None = None,
+    lightness_image: np.ndarray | None = None,
+    source_alpha_float: np.ndarray | None = None,
+    current_mask: np.ndarray | None = None,
+):
     """保存 CLI / GUI 共用的结果图像。"""
-    io.imsave(output_path, output_image)
+    normalized_options = normalize_luma_image_export_options(export_options, output_path=output_path)
+
+    if normalized_options.output_mode == "lightness-grayscale":
+        color_or_gray_float = _resolve_export_lightness_image(output_image, lightness_image)
+    else:
+        color_or_gray_float = _resolve_export_color_image(output_image, normalized_options)
+
+    export_codes = _float_image_to_export_codes(color_or_gray_float, normalized_options.bit_depth)
+    alpha_float = _resolve_export_alpha_plane(export_codes.shape, normalized_options, source_alpha_float, current_mask)
+    if alpha_float is not None:
+        alpha_codes = _float_image_to_export_codes(alpha_float, normalized_options.bit_depth)
+        export_codes = np.dstack([export_codes, alpha_codes])
+
+    io.imsave(output_path, export_codes)
 
 
 def normalize_luma_execution_request(request: LumaExecutionRequest) -> LumaExecutionRequest:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
 import os
 import time
@@ -17,7 +18,14 @@ from texture_map_toolbox.core.luma import (
     DEFAULT_FAST_PREVIEW_SCALE,
     DEFAULT_SEED_MASK_COLOR_TOLERANCE,
     DITHER_STRENGTH,
+    IMAGE_EXPORT_16BIT_FORMATS,
+    IMAGE_EXPORT_ALPHA_FORMATS,
+    IMAGE_EXPORT_COLOR_SPACES,
+    IMAGE_EXPORT_FORMATS,
+    IMAGE_EXPORT_FORMAT_SUFFIXES,
+    IMAGE_EXPORT_OUTPUT_MODES,
     LoadedImageData,
+    LumaImageExportOptions,
     OklchCurveModel,
     STATE_CURVE_CTRL_POINTS,
     apply_luma_preview_lut,
@@ -38,6 +46,9 @@ from texture_map_toolbox.core.luma import (
     reconstruct_from_state_curves,
     resolve_dither_strength,
     resolve_input_image_path,
+    infer_luma_image_export_format,
+    normalize_luma_export_output_path,
+    normalize_luma_image_export_options,
     save_luma_output_image,
 )
 from texture_map_toolbox.gui.luma_plots import plot_comparison
@@ -74,6 +85,37 @@ MASK_REGION_OFFSET_MIN = -64
 MASK_REGION_OFFSET_MAX = 64
 SEED_MARKER_FILL_COLOR = QtGui.QColor("#ff6b4a")
 SEED_MARKER_OUTLINE_COLOR = QtGui.QColor("#ffffff")
+EXPORT_FORMAT_LABELS = {
+    "png": "PNG",
+    "jpeg": "JPEG",
+    "bmp": "BMP",
+    "tiff": "TIFF",
+    "webp": "WebP",
+}
+EXPORT_COLOR_SPACE_LABELS = {
+    "srgb": "sRGB",
+    "linear-srgb": "Linear sRGB",
+}
+EXPORT_OUTPUT_MODE_LABELS = {
+    "color": "Color image",
+    "lightness-grayscale": "Single-channel L grayscale",
+}
+EXPORT_ALPHA_MODE_LABELS = {
+    "source-alpha": "Use source/original alpha",
+    "current-mask": "Use current mask as alpha",
+}
+
+
+@dataclass
+class FullResolutionRenderResult:
+    recolored_rgb_float: np.ndarray
+    recolored_rgb_int: np.ndarray
+    recolored_lightness: np.ndarray
+    y_eval: np.ndarray
+    gamut_pixels: int
+    psnr: float
+    delta_e_image: np.ndarray
+    delta_e_stats: dict[str, float]
 
 
 def _evaluate_hue_curve(
@@ -138,6 +180,280 @@ def _track_top_level_window(window: QtWidgets.QWidget):
 
     window.destroyed.connect(_release_window)
     return window
+
+
+class QtImageExportDialog(QtWidgets.QDialog):
+    """Modal dialog for configuring image export parameters."""
+
+    def __init__(
+        self,
+        parent: QtWidgets.QWidget | None,
+        *,
+        initial_output_path: str,
+        initial_export_options: LumaImageExportOptions | None,
+        initial_dither_strength: float,
+        source_bit_depth: int | None = None,
+        source_quantization_step: float | None = None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("Export Image")
+        self.resize(620, 420)
+        self._source_bit_depth = source_bit_depth
+        self._source_quantization_step = source_quantization_step
+
+        normalized_options = normalize_luma_image_export_options(
+            initial_export_options,
+            output_path=initial_output_path,
+        )
+        self._selected_format_name = normalized_options.format_name
+
+        root_layout = QtWidgets.QVBoxLayout(self)
+        root_layout.setContentsMargins(18, 18, 18, 18)
+        root_layout.setSpacing(12)
+
+        description_label = QtWidgets.QLabel(
+            "Choose the output file path and how the full-resolution image should be encoded. Use Browse to choose the file format in the Windows save dialog."
+        )
+        description_label.setWordWrap(True)
+        root_layout.addWidget(description_label)
+
+        path_layout = QtWidgets.QHBoxLayout()
+        self.output_path_edit = QtWidgets.QLineEdit(initial_output_path)
+        self.output_path_edit.setPlaceholderText("Output image path")
+        self.browse_button = QtWidgets.QPushButton("Browse")
+        path_layout.addWidget(self.output_path_edit, 1)
+        path_layout.addWidget(self.browse_button)
+        root_layout.addLayout(path_layout)
+
+        form_layout = QtWidgets.QFormLayout()
+        form_layout.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        root_layout.addLayout(form_layout)
+
+        self.bit_depth_combo = QtWidgets.QComboBox()
+        form_layout.addRow("Bit depth", self.bit_depth_combo)
+
+        self.color_space_combo = QtWidgets.QComboBox()
+        for color_space in IMAGE_EXPORT_COLOR_SPACES:
+            self.color_space_combo.addItem(EXPORT_COLOR_SPACE_LABELS[color_space], color_space)
+        form_layout.addRow("Color space", self.color_space_combo)
+
+        self.output_mode_combo = QtWidgets.QComboBox()
+        for output_mode in IMAGE_EXPORT_OUTPUT_MODES:
+            self.output_mode_combo.addItem(EXPORT_OUTPUT_MODE_LABELS[output_mode], output_mode)
+        form_layout.addRow("Output", self.output_mode_combo)
+
+        self.alpha_mode_combo = QtWidgets.QComboBox()
+        for alpha_mode, label in EXPORT_ALPHA_MODE_LABELS.items():
+            self.alpha_mode_combo.addItem(label, alpha_mode)
+        form_layout.addRow("Alpha", self.alpha_mode_combo)
+
+        dither_layout = QtWidgets.QHBoxLayout()
+        self.dither_checkbox = QtWidgets.QCheckBox("Enable blue-noise dither")
+        self.dither_strength_spinbox = QtWidgets.QDoubleSpinBox()
+        self.dither_strength_spinbox.setDecimals(6)
+        self.dither_strength_spinbox.setRange(0.0, 1.0)
+        self.dither_strength_spinbox.setSingleStep(0.0005)
+        self.dither_strength_spinbox.setValue(max(0.0, float(initial_dither_strength)))
+        dither_layout.addWidget(self.dither_checkbox)
+        dither_layout.addWidget(self.dither_strength_spinbox)
+        form_layout.addRow("Precurve dither", dither_layout)
+
+        self.dither_help_label = QtWidgets.QLabel()
+        self.dither_help_label.setWordWrap(True)
+        self.dither_help_label.setStyleSheet("color: #bbbbbb;")
+        form_layout.addRow("", self.dither_help_label)
+
+        self.info_label = QtWidgets.QLabel()
+        self.info_label.setWordWrap(True)
+        self.info_label.setStyleSheet("color: #bbbbbb;")
+        root_layout.addWidget(self.info_label)
+
+        self.button_box = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok | QtWidgets.QDialogButtonBox.StandardButton.Cancel
+        )
+        root_layout.addWidget(self.button_box)
+
+        self.browse_button.clicked.connect(self._browse_output_path)
+        self.button_box.accepted.connect(self.accept)
+        self.button_box.rejected.connect(self.reject)
+        self.output_path_edit.textChanged.connect(self._sync_dynamic_controls)
+        self.output_mode_combo.currentIndexChanged.connect(self._sync_dynamic_controls)
+        self.dither_checkbox.toggled.connect(self.dither_strength_spinbox.setEnabled)
+        self.dither_checkbox.toggled.connect(self._sync_dither_help_text)
+        self.dither_strength_spinbox.valueChanged.connect(self._sync_dither_help_text)
+
+        self._set_combo_value(self.color_space_combo, normalized_options.color_space)
+        self._set_combo_value(self.output_mode_combo, normalized_options.output_mode)
+        self._set_combo_value(self.alpha_mode_combo, normalized_options.alpha_mode)
+        self.dither_checkbox.setChecked(float(initial_dither_strength) > 0.0)
+        self._sync_bit_depth_combo(normalized_options.bit_depth)
+        self._sync_dither_help_text()
+        self._sync_dynamic_controls()
+
+    def _set_combo_value(self, combo_box: QtWidgets.QComboBox, value: str | int):
+        for index in range(combo_box.count()):
+            if combo_box.itemData(index) == value:
+                combo_box.setCurrentIndex(index)
+                return
+
+    def _filter_text_for_format_name(self, format_name: str) -> str:
+        label = EXPORT_FORMAT_LABELS[format_name]
+        suffix = IMAGE_EXPORT_FORMAT_SUFFIXES[format_name]
+        alt_suffix = ""
+        if format_name == "jpeg":
+            alt_suffix = " *.jpeg"
+        elif format_name == "tiff":
+            alt_suffix = " *.tif"
+        return f"{label} Files (*{suffix}{alt_suffix})"
+
+    def _current_format_name(self) -> str:
+        output_path = self.output_path_edit.text().strip()
+        if output_path:
+            try:
+                return infer_luma_image_export_format(output_path)
+            except ValueError:
+                pass
+        return self._selected_format_name
+
+    def _current_output_mode(self) -> str:
+        return str(self.output_mode_combo.currentData())
+
+    def _sync_bit_depth_combo(self, preferred_bit_depth: int | None = None):
+        selected_format = self._current_format_name()
+        grayscale_output = self._current_output_mode() == "lightness-grayscale"
+        allowed_depths = [8, 16] if selected_format in IMAGE_EXPORT_16BIT_FORMATS and grayscale_output else [8]
+        current_depth = preferred_bit_depth
+        if current_depth is None and self.bit_depth_combo.count() > 0:
+            current_depth = int(self.bit_depth_combo.currentData())
+
+        self.bit_depth_combo.blockSignals(True)
+        self.bit_depth_combo.clear()
+        for bit_depth in allowed_depths:
+            self.bit_depth_combo.addItem(f"{bit_depth}-bit", bit_depth)
+        self.bit_depth_combo.blockSignals(False)
+
+        target_depth = current_depth if current_depth in allowed_depths else allowed_depths[0]
+        self._set_combo_value(self.bit_depth_combo, target_depth)
+
+    def _file_dialog_filters(self) -> str:
+        return ";;".join([
+            *(self._filter_text_for_format_name(format_name) for format_name in IMAGE_EXPORT_FORMATS),
+            "All Files (*)",
+        ])
+
+    def _format_name_from_selected_filter(self, selected_filter: str) -> str | None:
+        for format_name in IMAGE_EXPORT_FORMATS:
+            if selected_filter == self._filter_text_for_format_name(format_name):
+                return format_name
+        return None
+
+    def _normalized_output_path(self) -> str:
+        output_path = self.output_path_edit.text().strip()
+        if not output_path:
+            return ""
+        return normalize_luma_export_output_path(output_path, self.selected_export_options())
+
+    def _browse_output_path(self):
+        selected_path, selected_filter = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Export recolored image",
+            self._normalized_output_path() or self.output_path_edit.text().strip(),
+            self._file_dialog_filters(),
+            self._filter_text_for_format_name(self._current_format_name()),
+        )
+        if selected_path:
+            selected_format_name = self._format_name_from_selected_filter(selected_filter)
+            if selected_format_name is not None:
+                self._selected_format_name = selected_format_name
+            target_format_name = selected_format_name or self._selected_format_name
+            normalized_path = normalize_luma_export_output_path(
+                selected_path,
+                LumaImageExportOptions(format_name=target_format_name),
+            )
+            self.output_path_edit.setText(normalized_path)
+
+    def _sync_dither_help_text(self):
+        current_value = float(self.dither_strength_spinbox.value())
+        help_parts = [
+            f"The value is an absolute normalized dither amplitude in [0, 1]. Current field value: {current_value:.6f}."
+        ]
+
+        if self._source_quantization_step is not None:
+            half_step = 0.5 * float(self._source_quantization_step)
+            if self._source_bit_depth is not None and self._source_bit_depth > 1:
+                levels = (1 << int(self._source_bit_depth)) - 1
+                help_parts.append(
+                    "Reference for this source image: auto dither uses half of the {}-bit code step, "
+                    "so 0.5 / {} = {:.6f}.".format(
+                        int(self._source_bit_depth),
+                        levels,
+                        half_step,
+                    )
+                )
+            else:
+                help_parts.append(
+                    "Reference for this source image: auto dither uses half of the normalized input code step = {:.6f}."
+                    .format(half_step)
+                )
+        else:
+            help_parts.append(
+                "Reference for floating-point input: there is no integer code step, so auto dither resolves to 0.0."
+            )
+
+        if not self.dither_checkbox.isChecked():
+            help_parts.append("If unchecked, export uses 0.0 dither regardless of the numeric field.")
+
+        self.dither_help_label.setText(" ".join(help_parts))
+
+    def _sync_dynamic_controls(self):
+        self._sync_bit_depth_combo()
+        selected_format = self._current_format_name()
+        grayscale_output = self._current_output_mode() == "lightness-grayscale"
+        current_bit_depth = int(self.bit_depth_combo.currentData())
+        alpha_supported = selected_format in IMAGE_EXPORT_ALPHA_FORMATS and current_bit_depth == 8
+
+        self.alpha_mode_combo.setEnabled(alpha_supported)
+        self.color_space_combo.setEnabled(not grayscale_output)
+
+        info_parts = []
+        if selected_format not in IMAGE_EXPORT_16BIT_FORMATS:
+            info_parts.append("This format is limited to 8-bit export.")
+        elif not grayscale_output:
+            info_parts.append("16-bit export is available only for single-channel L grayscale output.")
+        if selected_format not in IMAGE_EXPORT_ALPHA_FORMATS:
+            info_parts.append("This format does not store alpha, so the alpha setting will be ignored.")
+        elif current_bit_depth == 16:
+            info_parts.append("The current backend does not support 16-bit alpha export, so alpha will be omitted.")
+        if grayscale_output:
+            info_parts.append("L grayscale writes the reconstructed Oklch lightness channel as a single-channel image.")
+        self.info_label.setText(" ".join(info_parts) or "Export settings will be applied to the next full-resolution render.")
+
+    def selected_output_path(self) -> str:
+        return self._normalized_output_path()
+
+    def selected_export_options(self) -> LumaImageExportOptions:
+        return normalize_luma_image_export_options(
+            LumaImageExportOptions(
+                format_name=self._current_format_name(),
+                bit_depth=int(self.bit_depth_combo.currentData()),
+                color_space=str(self.color_space_combo.currentData()),
+                output_mode=str(self.output_mode_combo.currentData()),
+                alpha_mode=str(self.alpha_mode_combo.currentData()),
+            )
+        )
+
+    def selected_dither_strength(self) -> float:
+        if not self.dither_checkbox.isChecked():
+            return 0.0
+        return float(self.dither_strength_spinbox.value())
+
+    def accept(self):
+        normalized_path = self._normalized_output_path()
+        if not normalized_path:
+            QtWidgets.QMessageBox.warning(self, "Export Image", "Please choose an output path.")
+            return
+        self.output_path_edit.setText(normalized_path)
+        super().accept()
 
 
 def _coalesce_seed_points(
@@ -1562,7 +1878,11 @@ class QtOklchCurveEditorWindow(QtWidgets.QMainWindow):
         self.dither_strength = 0.0 if dither_strength is None else float(dither_strength)
         self.curve_output_path = curve_output_path or self._default_curve_output_path()
         self.output_image_path = self._default_output_image_path()
+        self.export_image_options = LumaImageExportOptions()
         self.source_lightness_samples = self.oklch_float[self.valid_mask, 0]
+        self.source_alpha_float = np.ones_like(self.valid_mask, dtype=np.float64)
+        self.input_bit_depth: int | None = None
+        self.input_quantization_step: float | None = None
         self.target_curve_image_paths: dict[str, str] = {}
         self.target_curve_mask_paths: dict[str, str | None] = {}
         self._lightness_reference_histogram: tuple[np.ndarray, np.ndarray] | None = None
@@ -1940,15 +2260,12 @@ class QtOklchCurveEditorWindow(QtWidgets.QMainWindow):
         action_layout = QtWidgets.QHBoxLayout()
         self.save_button = QtWidgets.QPushButton("Save Curves JSON")
         self.export_image_button = QtWidgets.QPushButton("Export Image")
-        self.export_dither_checkbox = QtWidgets.QCheckBox("Export with Dither")
-        self.export_dither_checkbox.setChecked(self.dither_strength > 0.0)
         self.render_button = QtWidgets.QPushButton("Full-Resolution Render")
         self.load_target_picker_button = QtWidgets.QPushButton("Load L/C/H Target")
         self.status_label = QtWidgets.QLabel("Ready")
         self.status_label.setStyleSheet("color: #ddd;")
         action_layout.addWidget(self.save_button)
         action_layout.addWidget(self.export_image_button)
-        action_layout.addWidget(self.export_dither_checkbox)
         action_layout.addWidget(self.render_button)
         action_layout.addWidget(self.load_target_picker_button)
         action_layout.addWidget(self.status_label, 1)
@@ -2374,7 +2691,7 @@ class QtOklchCurveEditorWindow(QtWidgets.QMainWindow):
         """Run the shared full-resolution reconstruction used by render and export."""
         state_curves = self._last_state_curves or self._build_state_curves()
         render_dither_strength = self.dither_strength if dither_strength is None else float(dither_strength)
-        recolored_rgb_float, _, y_eval, gamut_pixels = reconstruct_from_state_curves(
+        recolored_rgb_float, recolored_oklch, y_eval, gamut_pixels = reconstruct_from_state_curves(
             self.oklch_float,
             self.valid_mask,
             state_curves,
@@ -2386,58 +2703,89 @@ class QtOklchCurveEditorWindow(QtWidgets.QMainWindow):
             recolored_rgb_float,
             self.valid_mask,
         )
-        return recolored_rgb_int, y_eval, gamut_pixels, psnr, delta_e_image, delta_e_stats
-
-    def _select_output_image_path(self) -> str | None:
-        selected_path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self,
-            "Export recolored image",
-            self.output_image_path,
-            "PNG Files (*.png);;JPEG Files (*.jpg *.jpeg);;BMP Files (*.bmp);;TIFF Files (*.tif *.tiff);;WebP Files (*.webp);;All Files (*)",
+        return FullResolutionRenderResult(
+            recolored_rgb_float=recolored_rgb_float,
+            recolored_rgb_int=recolored_rgb_int,
+            recolored_lightness=np.asarray(recolored_oklch[:, :, 0], dtype=np.float64),
+            y_eval=y_eval,
+            gamut_pixels=gamut_pixels,
+            psnr=psnr,
+            delta_e_image=delta_e_image,
+            delta_e_stats=delta_e_stats,
         )
-        if not selected_path:
+
+    def _select_output_image_export(self) -> tuple[str, LumaImageExportOptions, float] | None:
+        dialog = QtImageExportDialog(
+            self,
+            initial_output_path=self.output_image_path,
+            initial_export_options=self.export_image_options,
+            initial_dither_strength=self.dither_strength,
+            source_bit_depth=self.input_bit_depth,
+            source_quantization_step=self.input_quantization_step,
+        )
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
             return None
-        self.output_image_path = selected_path
-        return selected_path
+        output_path = dialog.selected_output_path()
+        export_options = dialog.selected_export_options()
+        export_dither_strength = dialog.selected_dither_strength()
+        self.output_image_path = output_path
+        self.export_image_options = export_options
+        return output_path, export_options, export_dither_strength
 
     def _export_full_resolution_image(self):
         """Render the current state curves at full resolution and save the output image."""
-        output_path = self._select_output_image_path()
-        if output_path is None:
+        export_request = self._select_output_image_export()
+        if export_request is None:
             self.status_label.setText("Image export canceled")
             return
 
+        output_path, export_options, export_dither_strength = export_request
+
         try:
-            export_dither_strength = self.dither_strength
-            if self.export_dither_checkbox is not None and not self.export_dither_checkbox.isChecked():
-                export_dither_strength = 0.0
-            recolored_rgb_int, _, gamut_pixels, psnr, _, delta_e_stats = self._compute_full_resolution_render(
+            render_result = self._compute_full_resolution_render(
                 dither_strength=export_dither_strength,
             )
-            save_luma_output_image(recolored_rgb_int, output_path)
+            save_luma_output_image(
+                render_result.recolored_rgb_float,
+                output_path,
+                export_options=export_options,
+                lightness_image=render_result.recolored_lightness,
+                source_alpha_float=self.source_alpha_float,
+                current_mask=self.valid_mask,
+            )
         except Exception as exc:  # noqa: BLE001
             self._show_error("Export Image Failed", str(exc))
             return
 
         self.status_label.setText(
-            "Exported image: {}  dither={}  gamut={}  PSNR={:.2f} dB  DeltaE mean={:.2f}"
+            "Exported image: {}  dither={}  format={}/{}-bit  mode={}  gamut={}  PSNR={:.2f} dB  DeltaE mean={:.2f}"
             .format(
                 output_path,
                 "on" if export_dither_strength > 0.0 else "off",
-                gamut_pixels,
-                psnr,
-                delta_e_stats["mean"],
+                export_options.format_name,
+                export_options.bit_depth,
+                export_options.output_mode,
+                render_result.gamut_pixels,
+                render_result.psnr,
+                render_result.delta_e_stats["mean"],
             )
         )
 
     def _render_full_resolution(self):
         """Run the original full-resolution reconstruction and display comparison plots."""
-        recolored_rgb_int, y_eval, gamut_pixels, psnr, delta_e_image, delta_e_stats = self._compute_full_resolution_render()
-        plot_comparison(self.rgb_float, y_eval, recolored_rgb_int, self.valid_mask, psnr, delta_e_image)
+        render_result = self._compute_full_resolution_render()
+        plot_comparison(
+            self.rgb_float,
+            render_result.y_eval,
+            render_result.recolored_rgb_int,
+            self.valid_mask,
+            render_result.psnr,
+            render_result.delta_e_image,
+        )
         show_figures(block=False)
         self.status_label.setText(
             "Full render complete: gamut={}  PSNR={:.2f} dB  DeltaE mean={:.2f}"
-            .format(gamut_pixels, psnr, delta_e_stats["mean"])
+            .format(render_result.gamut_pixels, render_result.psnr, render_result.delta_e_stats["mean"])
         )
 
 
@@ -3009,6 +3357,13 @@ def build_qt_editor(
     window.image_warnings = loaded_image.image_warnings
     window.alpha_source = loaded_image.alpha_source
     window.alpha_mask_path = loaded_image.alpha_mask_path
+    window.source_alpha_float = np.asarray(loaded_image.embedded_alpha_float, dtype=np.float64)
+    window.input_bit_depth = loaded_image.input_bit_depth
+    window.input_quantization_step = loaded_image.input_quantization_step
+    window.export_image_options = normalize_luma_image_export_options(
+        window.export_image_options,
+        output_path=window.output_image_path,
+    )
     window.show_warning_dialogs = False
     return _track_top_level_window(window)
 

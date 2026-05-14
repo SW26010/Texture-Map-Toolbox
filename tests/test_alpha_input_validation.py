@@ -190,6 +190,12 @@ class AlphaInputValidationTests(unittest.TestCase):
             self.assertEqual(loaded_image.alpha_source, "external-mask")
             self.assertEqual(loaded_image.alpha_mask_path, str(mask_path.resolve()))
             self.assertTrue(np.array_equal(loaded_image.valid_mask, expected_mask))
+            self.assertTrue(
+                np.array_equal(
+                    loaded_image.embedded_alpha_float,
+                    np.ones((2, 3), dtype=np.float64),
+                )
+            )
 
     def test_alpha_mask_size_must_match_source_image(self):
         with tempfile.TemporaryDirectory() as temp_dir:
