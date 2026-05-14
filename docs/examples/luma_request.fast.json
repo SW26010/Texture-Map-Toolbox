@@ -2,7 +2,7 @@
   "image_path": "path/to/image.png",
   "algorithm": "fast",
   "curve_path": null,
-  "dither_strength": 0.0,
+  "dither_strength": null,
   "evaluate_result": false,
   "show_plots": false,
   "preview_scale": 0.25,

@@ -65,7 +65,7 @@ python -m texture_map_toolbox luma --request-json docs/examples/luma_request.fas
 	- `fast` 使用与 Qt 编辑器共享的快速预览 LUT 路径
 - `--alpha-mask path/to/mask.png`：用同尺寸二值/灰度 mask 覆盖图像自带 alpha
 - `--curves path/to/curves.json`：读取 `Lt / Ct / ht` 控制点
-- `--dither-strength`：输入轴预曲线抖动幅度
+- `--dither-strength`：输入轴预曲线蓝噪声峰值；省略时自动取输入图像归一化码值间隔的一半（8bit 为 `0.5/255`，16bit 为 `0.5/65535`）
 - `--preview-scale` / `--preview-lut-size`：控制 `fast` 模式
 - `--output-image`：保存输出图像
 - `--result-json` / `--summary-json`：输出结果摘要 JSON
@@ -105,7 +105,7 @@ python -m texture_map_toolbox editor --backend qt
 - `--alpha-mask`：可选外部 mask
 - `--curves`：可选初始曲线 JSON
 - `--curve-output`：保存曲线 JSON 的默认路径
-- `--dither-strength`：输入轴预曲线抖动幅度
+- `--dither-strength`：输入轴预曲线蓝噪声峰值；省略时自动取输入图像归一化码值间隔的一半（8bit 为 `0.5/255`，16bit 为 `0.5/65535`）
 - `--backend {matplotlib,qt}`：选择编辑器后端，默认是 `matplotlib`
 
 ### Qt 后端行为
@@ -154,7 +154,7 @@ connected-region seed mask 当前支持：
 - `alpha_mask_path`
 - `curve_path`
 - `algorithm`
-- `dither_strength`
+- `dither_strength`（可选；省略或 `null` 表示自动半步，`0.0` 表示关闭）
 - `evaluate_result`
 - `show_plots`
 - `preview_scale`
@@ -179,6 +179,10 @@ connected-region seed mask 当前支持：
 - `curve_path`
 - `curve_source`
 - `dither_strength`
+- `dither_strength_source`
+- `input_dtype`
+- `input_bit_depth`
+- `input_quantization_step`
 - `source_image_shape`
 - `output_image_shape`
 - `output_scale`

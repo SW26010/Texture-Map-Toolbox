@@ -1,6 +1,7 @@
 """Core Oklch luma workflow implementation."""
 
 from dataclasses import dataclass
+from functools import lru_cache
 import json
 from pathlib import Path
 
@@ -15,8 +16,10 @@ from skimage.util import img_as_float, img_as_ubyte
 
 MIN_KEYPOINTS = 256
 HUE_CHROMA_FLOOR = 1e-4
-DITHER_STRENGTH = 0.0
+# None means auto: half the input image's normalized integer code-value spacing.
+DITHER_STRENGTH = None
 DITHER_SEED = 0
+BLUE_NOISE_TILE_SIZE = 128
 STATE_CURVE_CTRL_POINTS = 16
 DEFAULT_FAST_PREVIEW_SCALE = 0.25
 DEFAULT_FAST_LUT_SIZE = 512
@@ -82,6 +85,38 @@ def resolve_optional_path(path: str | None, *, argument_name: str) -> str | None
     return str(resolved_path)
 
 
+def infer_input_quantization_step(image: np.ndarray) -> tuple[str, int | None, float | None]:
+    """Return dtype name, bit depth, and normalized code-value spacing for integer inputs."""
+    dtype = np.asarray(image).dtype
+    dtype_name = str(dtype)
+    if np.issubdtype(dtype, np.bool_):
+        return dtype_name, 1, 1.0
+    if not np.issubdtype(dtype, np.integer):
+        return dtype_name, None, None
+
+    info = np.iinfo(dtype)
+    code_range = int(info.max) - int(info.min)
+    if code_range <= 0:
+        return dtype_name, int(info.bits), None
+    return dtype_name, int(info.bits), 1.0 / float(code_range)
+
+
+def resolve_dither_strength(
+    requested_strength: float | None,
+    loaded_image: "LoadedImageData",
+) -> tuple[float, str]:
+    """Resolve None/auto dither to half the input image's normalized code step."""
+    if requested_strength is None:
+        if loaded_image.input_quantization_step is None:
+            return 0.0, "auto-float-disabled"
+        return 0.5 * float(loaded_image.input_quantization_step), "auto-half-input-step"
+
+    resolved_strength = float(requested_strength)
+    if resolved_strength < 0.0:
+        raise ValueError("dither_strength must be >= 0, or null/None for auto")
+    return resolved_strength, "manual"
+
+
 @dataclass
 class OklchCurveModel:
     key_y: np.ndarray
@@ -109,7 +144,7 @@ class LumaExecutionRequest:
     alpha_mask_path: str | None = None
     curve_path: str | None = None
     algorithm: str = "original"
-    dither_strength: float = DITHER_STRENGTH
+    dither_strength: float | None = DITHER_STRENGTH
     evaluate_result: bool = True
     show_plots: bool = True
     preview_scale: float = DEFAULT_FAST_PREVIEW_SCALE
@@ -135,6 +170,9 @@ class LoadedImageData:
     alpha_float: np.ndarray
     oklch_float: np.ndarray
     valid_mask: np.ndarray
+    input_dtype: str
+    input_bit_depth: int | None
+    input_quantization_step: float | None
     alpha_source: str
     image_warnings: tuple[str, ...] = ()
     mask_prompt_required: bool = False
@@ -147,6 +185,10 @@ class LumaExecutionResult:
     alpha_mask_path: str | None
     curve_path: str | None
     dither_strength: float
+    dither_strength_source: str
+    input_dtype: str
+    input_bit_depth: int | None
+    input_quantization_step: float | None
     source_image_shape: tuple[int, int]
     output_image_shape: tuple[int, int]
     output_scale: float
@@ -623,6 +665,7 @@ def load_image_data(
     resolved_alpha_mask_path = resolve_optional_path(alpha_mask_path, argument_name="alpha mask image")
 
     original_image = io.imread(resolved_image_path)
+    input_dtype, input_bit_depth, input_quantization_step = infer_input_quantization_step(original_image)
     image_float = img_as_float(original_image)
     if image_float.ndim != 3 or image_float.shape[2] < 3:
         raise ValueError("input image must contain at least three color channels")
@@ -675,6 +718,9 @@ def load_image_data(
         alpha_float=alpha_float,
         oklch_float=oklch_float,
         valid_mask=valid_mask,
+        input_dtype=input_dtype,
+        input_bit_depth=input_bit_depth,
+        input_quantization_step=input_quantization_step,
         alpha_source=alpha_source,
         image_warnings=_build_image_alpha_warnings(
             resolved_image_path,
@@ -806,12 +852,13 @@ def save_luma_output_image(output_image: np.ndarray, output_path: str):
 
 def normalize_luma_execution_request(request: LumaExecutionRequest) -> LumaExecutionRequest:
     """补齐默认值并校验统一执行请求。"""
+    dither_strength = None if request.dither_strength is None else float(request.dither_strength)
     normalized = LumaExecutionRequest(
         image_path=resolve_input_image_path(request.image_path),
         alpha_mask_path=resolve_optional_path(request.alpha_mask_path, argument_name="alpha mask image"),
         curve_path=request.curve_path,
         algorithm=request.algorithm or "original",
-        dither_strength=float(request.dither_strength),
+        dither_strength=dither_strength,
         evaluate_result=bool(request.evaluate_result),
         show_plots=bool(request.show_plots),
         preview_scale=float(request.preview_scale),
@@ -826,6 +873,8 @@ def normalize_luma_execution_request(request: LumaExecutionRequest) -> LumaExecu
         raise ValueError("preview_scale must be > 0")
     if normalized.preview_lut_size < 2:
         raise ValueError("preview_lut_size must be at least 2")
+    if normalized.dither_strength is not None and normalized.dither_strength < 0.0:
+        raise ValueError("dither_strength must be >= 0, or null/None for auto")
     return normalized
 
 
@@ -1150,6 +1199,46 @@ def load_state_curve_overrides(curve_path: str | None) -> dict:
     return overrides
 
 
+@lru_cache(maxsize=8)
+def _build_blue_noise_tile(height: int, width: int, random_seed: int) -> np.ndarray:
+    """生成可平铺的蓝噪声 tile，并归一化到 [-1, 1]。"""
+    rng = np.random.default_rng(random_seed)
+    white_noise = rng.standard_normal((height, width))
+
+    freq_y = np.fft.fftfreq(height)[:, np.newaxis]
+    freq_x = np.fft.fftfreq(width)[np.newaxis, :]
+    radius = np.hypot(freq_y, freq_x)
+    spectral_weight = radius
+    spectral_weight[0, 0] = 0.0
+
+    blue_noise = np.fft.ifft2(np.fft.fft2(white_noise) * spectral_weight).real
+    blue_noise -= np.mean(blue_noise)
+
+    order = np.argsort(blue_noise, axis=None, kind="mergesort")
+    ranks = np.empty(order.size, dtype=np.float64)
+    ranks[order] = (np.arange(order.size, dtype=np.float64) + 0.5) / order.size
+    centered = ranks.reshape((height, width)) * 2.0 - 1.0
+
+    peak = np.max(np.abs(centered))
+    if peak > 0.0:
+        centered /= peak
+    return centered
+
+
+def _blue_noise_image(shape: tuple[int, int], random_seed: int = DITHER_SEED) -> np.ndarray:
+    """按请求尺寸平铺蓝噪声 tile。"""
+    height, width = shape
+    tile_height = max(1, min(int(height), BLUE_NOISE_TILE_SIZE))
+    tile_width = max(1, min(int(width), BLUE_NOISE_TILE_SIZE))
+    tile = _build_blue_noise_tile(tile_height, tile_width, int(random_seed))
+
+    if tile_height != height or tile_width != width:
+        repeat_y = (height + tile_height - 1) // tile_height
+        repeat_x = (width + tile_width - 1) // tile_width
+        tile = np.tile(tile, (repeat_y, repeat_x))
+    return tile[:height, :width]
+
+
 def apply_precurve_dither(
     y_image: np.ndarray,
     valid_mask: np.ndarray,
@@ -1158,11 +1247,13 @@ def apply_precurve_dither(
 ) -> np.ndarray:
     """在用户曲线求值前对输入骨架 y 做可选抖动。"""
     y_dithered = np.array(y_image, copy=True)
-    if strength <= 0.0:
+    valid_mask = np.asarray(valid_mask, dtype=bool)
+    if valid_mask.shape != y_image.shape:
+        raise ValueError("valid_mask must match y_image shape")
+    if strength <= 0.0 or not np.any(valid_mask):
         return y_dithered
 
-    rng = np.random.default_rng(random_seed)
-    noise = rng.uniform(-strength, strength, size=y_image.shape)
+    noise = _blue_noise_image(y_image.shape, random_seed=random_seed) * float(strength)
     y_dithered[valid_mask] = np.clip(y_dithered[valid_mask] + noise[valid_mask], 0.0, 1.0)
     return y_dithered
 
@@ -1233,19 +1324,27 @@ def reconstruct_from_state_curves(
     oklch_float: np.ndarray,
     valid_mask: np.ndarray,
     state_curves: StateCurveSet,
-    dither_strength: float = DITHER_STRENGTH,
+    dither_strength: float = 0.0,
     output_valid_mask: np.ndarray | None = None,
+    dither_mask: np.ndarray | None = None,
 ):
     """对抖动后的输入轴先求 Lt，再通过 Ct / ht 生成最终颜色状态。"""
+    valid_mask = np.asarray(valid_mask, dtype=bool)
     if output_valid_mask is None:
         output_valid_mask = valid_mask
     else:
         output_valid_mask = np.asarray(output_valid_mask, dtype=bool)
         if output_valid_mask.shape != valid_mask.shape:
             raise ValueError("output_valid_mask must match valid_mask shape")
+    if dither_mask is None:
+        dither_mask = valid_mask
+    else:
+        dither_mask = np.asarray(dither_mask, dtype=bool)
+        if dither_mask.shape != valid_mask.shape:
+            raise ValueError("dither_mask must match valid_mask shape")
 
     y_image = oklch_float[:, :, 0]
-    y_eval = apply_precurve_dither(y_image, output_valid_mask, dither_strength)
+    y_eval = apply_precurve_dither(y_image, dither_mask, dither_strength)
     lightness_eval, chroma_eval, hue_eval = evaluate_state_curves(state_curves, y_eval)
     reconstructed_oklch = np.stack([lightness_eval, chroma_eval, hue_eval], axis=-1)
     if not np.all(output_valid_mask):
@@ -1291,6 +1390,7 @@ def run_original_luma_algorithm(request: LumaExecutionRequest) -> LumaExecutionR
     rgb_float = loaded_image.rgb_float
     oklch_float = loaded_image.oklch_float
     valid_mask = loaded_image.valid_mask
+    dither_strength, dither_strength_source = resolve_dither_strength(request.dither_strength, loaded_image)
     output_valid_mask = np.ones_like(valid_mask, dtype=bool)
     model, y_samples = build_oklch_curve_model(oklch_float, valid_mask)
     curve_overrides = load_state_curve_overrides(request.curve_path)
@@ -1299,8 +1399,9 @@ def run_original_luma_algorithm(request: LumaExecutionRequest) -> LumaExecutionR
         oklch_float,
         valid_mask,
         state_curves,
-        dither_strength=request.dither_strength,
+        dither_strength=dither_strength,
         output_valid_mask=output_valid_mask,
+        dither_mask=valid_mask,
     )
     recolored_rgb_int = quantize_rgb_image(recolored_rgb_float)
 
@@ -1319,7 +1420,11 @@ def run_original_luma_algorithm(request: LumaExecutionRequest) -> LumaExecutionR
         image_path=request.image_path,
         alpha_mask_path=request.alpha_mask_path,
         curve_path=request.curve_path,
-        dither_strength=request.dither_strength,
+        dither_strength=dither_strength,
+        dither_strength_source=dither_strength_source,
+        input_dtype=loaded_image.input_dtype,
+        input_bit_depth=loaded_image.input_bit_depth,
+        input_quantization_step=loaded_image.input_quantization_step,
         source_image_shape=tuple(int(value) for value in rgb_float.shape[:2]),
         output_image_shape=tuple(int(value) for value in rgb_float.shape[:2]),
         output_scale=1.0,
@@ -1348,6 +1453,7 @@ def run_fast_luma_algorithm(request: LumaExecutionRequest) -> LumaExecutionResul
     source_rgb_float = loaded_image.rgb_float
     source_oklch_float = loaded_image.oklch_float
     source_valid_mask = loaded_image.valid_mask
+    dither_strength, dither_strength_source = resolve_dither_strength(request.dither_strength, loaded_image)
     model, y_samples = build_oklch_curve_model(source_oklch_float, source_valid_mask)
     curve_overrides = load_state_curve_overrides(request.curve_path)
     state_curves = build_state_curve_set(model, **curve_overrides)
@@ -1360,8 +1466,8 @@ def run_fast_luma_algorithm(request: LumaExecutionRequest) -> LumaExecutionResul
     )
     y_eval = apply_precurve_dither(
         preview_frame.y_image,
-        np.ones_like(preview_frame.valid_mask, dtype=bool),
-        request.dither_strength,
+        preview_frame.valid_mask,
+        dither_strength,
     )
     y_index = compute_luma_lut_indices(y_eval, request.preview_lut_size)
     preview_lut_uint8, compressed_entries = build_luma_preview_lut(
@@ -1391,7 +1497,11 @@ def run_fast_luma_algorithm(request: LumaExecutionRequest) -> LumaExecutionResul
         image_path=request.image_path,
         alpha_mask_path=request.alpha_mask_path,
         curve_path=request.curve_path,
-        dither_strength=request.dither_strength,
+        dither_strength=dither_strength,
+        dither_strength_source=dither_strength_source,
+        input_dtype=loaded_image.input_dtype,
+        input_bit_depth=loaded_image.input_bit_depth,
+        input_quantization_step=loaded_image.input_quantization_step,
         source_image_shape=tuple(int(value) for value in source_rgb_float.shape[:2]),
         output_image_shape=tuple(int(value) for value in preview_frame.rgb_float.shape[:2]),
         output_scale=preview_frame.scale,
@@ -1430,7 +1540,7 @@ def run_luma_color_map(
     *,
     alpha_mask_path: str | None = None,
     curve_path: str | None = None,
-    dither_strength: float = DITHER_STRENGTH,
+    dither_strength: float | None = DITHER_STRENGTH,
     evaluate_result: bool = True,
     algorithm: str = "original",
     preview_scale: float = DEFAULT_FAST_PREVIEW_SCALE,
@@ -1462,6 +1572,10 @@ def summarize_luma_result(result: LumaExecutionResult) -> dict:
         "curve_path": result.curve_path,
         "curve_source": result.curve_path or "default base-model controls",
         "dither_strength": float(result.dither_strength),
+        "dither_strength_source": result.dither_strength_source,
+        "input_dtype": result.input_dtype,
+        "input_bit_depth": result.input_bit_depth,
+        "input_quantization_step": result.input_quantization_step,
         "source_image_shape": list(result.source_image_shape),
         "output_image_shape": list(result.output_image_shape),
         "output_scale": float(result.output_scale),
@@ -1534,6 +1648,7 @@ __all__ = [
     "find_oklab_cusp",
     "find_oklab_gamut_intersection_preserve_lightness",
     "fit_monotonic_lightness_transfer_curve",
+    "infer_input_quantization_step",
     "linear_srgb_to_oklab",
     "linear_to_srgb",
     "load_image",
@@ -1548,6 +1663,7 @@ __all__ = [
     "quantize_rgb_image",
     "reconstruct_from_state_curves",
     "resolve_input_image_path",
+    "resolve_dither_strength",
     "rgb_to_oklch",
     "run_fast_luma_algorithm",
     "run_luma_color_map",

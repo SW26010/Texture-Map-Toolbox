@@ -32,7 +32,7 @@ def configure_cli_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentPa
         "--dither-strength",
         type=float,
         default=DITHER_STRENGTH,
-        help="Optional pre-curve dither amplitude applied on the input lightness axis.",
+        help="Optional pre-curve blue-noise peak amplitude. Omit for auto: half the input image code-value step.",
     )
     parser.add_argument(
         "--backend",

@@ -27,6 +27,7 @@ from texture_map_toolbox.core.luma import (
     load_state_curve_overrides,
     prepare_control_points,
     reconstruct_from_state_curves,
+    resolve_dither_strength,
     resolve_input_image_path,
 )
 from texture_map_toolbox.gui.matplotlib_runtime import show_figures
@@ -62,7 +63,7 @@ class OklchCurveEditor:
         base_model: OklchCurveModel,
         *,
         initial_curve_overrides: dict | None = None,
-        dither_strength: float = DITHER_STRENGTH,
+        dither_strength: float | None = DITHER_STRENGTH,
         curve_output_path: str | None = None,
     ):
         self.image_path = image_path
@@ -70,7 +71,7 @@ class OklchCurveEditor:
         self.oklch_float = oklch_float
         self.valid_mask = valid_mask
         self.base_model = base_model
-        self.dither_strength = dither_strength
+        self.dither_strength = 0.0 if dither_strength is None else float(dither_strength)
         self.curve_output_path = curve_output_path or self._default_curve_output_path()
 
         self._build_preview_inputs()
@@ -293,9 +294,10 @@ class OklchCurveEditor:
         state_curves = self._last_state_curves or self._build_state_curves()
         recolored_rgb_float, _, y_eval, gamut_pixels = reconstruct_from_state_curves(
             self.oklch_float,
-            self._output_valid_mask,
+            self.valid_mask,
             state_curves,
             dither_strength=self.dither_strength,
+            output_valid_mask=self._output_valid_mask,
         )
         recolored_rgb_int, psnr, delta_e_image, delta_e_stats = evaluate_reconstruction(
             self.rgb_float,
@@ -386,7 +388,7 @@ def launch_editor(
     alpha_mask_path: str | None = None,
     curve_path: str | None = None,
     curve_output_path: str | None = None,
-    dither_strength: float = DITHER_STRENGTH,
+    dither_strength: float | None = DITHER_STRENGTH,
 ) -> OklchCurveEditor:
     """构建并返回编辑器对象，供 CLI 或 GUI 复用。"""
     resolved_image_path = resolve_input_image_path(image_path)
@@ -394,6 +396,7 @@ def launch_editor(
     rgb_float = loaded_image.rgb_float
     oklch_float = loaded_image.oklch_float
     valid_mask = loaded_image.valid_mask
+    resolved_dither_strength, _ = resolve_dither_strength(dither_strength, loaded_image)
     base_model, _ = build_oklch_curve_model(oklch_float, valid_mask)
     curve_overrides = load_state_curve_overrides(curve_path)
     editor = OklchCurveEditor(
@@ -403,7 +406,7 @@ def launch_editor(
         valid_mask,
         base_model,
         initial_curve_overrides=curve_overrides,
-        dither_strength=dither_strength,
+        dither_strength=resolved_dither_strength,
         curve_output_path=curve_output_path,
     )
     editor.image_warnings = loaded_image.image_warnings

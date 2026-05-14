@@ -44,7 +44,18 @@ def print_luma_summary(result: LumaExecutionResult):
         f"C={summary['state_curve_points']['chroma']}, "
         f"h={summary['state_curve_points']['hue']}"
     )
-    print(f"Pre-curve dither strength: {summary['dither_strength']:.6f}")
+    print(
+        "Pre-curve dither strength: "
+        f"{summary['dither_strength']:.8f} ({summary['dither_strength_source']})"
+    )
+    if summary["input_bit_depth"] is not None:
+        print(
+            "Input quantization: "
+            f"{summary['input_dtype']} / {summary['input_bit_depth']}-bit "
+            f"step={summary['input_quantization_step']:.8f}"
+        )
+    else:
+        print(f"Input quantization: {summary['input_dtype']} / floating or unknown")
     if summary["preview_lut_size"] is not None:
         print(f"Preview LUT size: {summary['preview_lut_size']}")
     print(f"Gamut-compressed pixels: {summary['gamut_compressed_pixels']}")
@@ -125,7 +136,7 @@ def configure_cli_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentPa
     parser.add_argument(
         "--dither-strength",
         type=float,
-        help="Optional pre-curve dither amplitude applied on the input lightness axis.",
+        help="Optional pre-curve blue-noise peak amplitude. Omit for auto: half the input image code-value step.",
     )
     parser.add_argument(
         "--preview-scale",

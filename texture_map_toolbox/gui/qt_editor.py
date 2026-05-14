@@ -36,6 +36,7 @@ from texture_map_toolbox.core.luma import (
     load_state_curve_overrides,
     prepare_control_points,
     reconstruct_from_state_curves,
+    resolve_dither_strength,
     resolve_input_image_path,
     save_luma_output_image,
 )
@@ -1548,7 +1549,7 @@ class QtOklchCurveEditorWindow(QtWidgets.QMainWindow):
         base_model: OklchCurveModel,
         *,
         initial_curve_overrides: dict | None = None,
-        dither_strength: float = DITHER_STRENGTH,
+        dither_strength: float | None = DITHER_STRENGTH,
         curve_output_path: str | None = None,
     ):
         super().__init__()
@@ -1558,7 +1559,7 @@ class QtOklchCurveEditorWindow(QtWidgets.QMainWindow):
         self.oklch_float = oklch_float
         self.valid_mask = valid_mask
         self.base_model = base_model
-        self.dither_strength = dither_strength
+        self.dither_strength = 0.0 if dither_strength is None else float(dither_strength)
         self.curve_output_path = curve_output_path or self._default_curve_output_path()
         self.output_image_path = self._default_output_image_path()
         self.source_lightness_samples = self.oklch_float[self.valid_mask, 0]
@@ -1573,6 +1574,7 @@ class QtOklchCurveEditorWindow(QtWidgets.QMainWindow):
         self.hue_display_start = float(HUE_DISPLAY_START_MIN)
         self.hue_display_start_slider: QtWidgets.QSlider | None = None
         self.hue_display_start_value_label: QtWidgets.QLabel | None = None
+        self.export_dither_checkbox: QtWidgets.QCheckBox | None = None
 
         self._build_preview_inputs()
         self._initialize_controls(initial_curve_overrides or {})
@@ -1938,12 +1940,15 @@ class QtOklchCurveEditorWindow(QtWidgets.QMainWindow):
         action_layout = QtWidgets.QHBoxLayout()
         self.save_button = QtWidgets.QPushButton("Save Curves JSON")
         self.export_image_button = QtWidgets.QPushButton("Export Image")
+        self.export_dither_checkbox = QtWidgets.QCheckBox("Export with Dither")
+        self.export_dither_checkbox.setChecked(self.dither_strength > 0.0)
         self.render_button = QtWidgets.QPushButton("Full-Resolution Render")
         self.load_target_picker_button = QtWidgets.QPushButton("Load L/C/H Target")
         self.status_label = QtWidgets.QLabel("Ready")
         self.status_label.setStyleSheet("color: #ddd;")
         action_layout.addWidget(self.save_button)
         action_layout.addWidget(self.export_image_button)
+        action_layout.addWidget(self.export_dither_checkbox)
         action_layout.addWidget(self.render_button)
         action_layout.addWidget(self.load_target_picker_button)
         action_layout.addWidget(self.status_label, 1)
@@ -2365,14 +2370,16 @@ class QtOklchCurveEditorWindow(QtWidgets.QMainWindow):
             handle.write("\n")
         self.status_label.setText(f"Saved curves: {self.curve_output_path}")
 
-    def _compute_full_resolution_render(self):
+    def _compute_full_resolution_render(self, *, dither_strength: float | None = None):
         """Run the shared full-resolution reconstruction used by render and export."""
         state_curves = self._last_state_curves or self._build_state_curves()
+        render_dither_strength = self.dither_strength if dither_strength is None else float(dither_strength)
         recolored_rgb_float, _, y_eval, gamut_pixels = reconstruct_from_state_curves(
             self.oklch_float,
-            self._output_valid_mask,
+            self.valid_mask,
             state_curves,
-            dither_strength=self.dither_strength,
+            dither_strength=render_dither_strength,
+            output_valid_mask=self._output_valid_mask,
         )
         recolored_rgb_int, psnr, delta_e_image, delta_e_stats = evaluate_reconstruction(
             self.rgb_float,
@@ -2401,15 +2408,26 @@ class QtOklchCurveEditorWindow(QtWidgets.QMainWindow):
             return
 
         try:
-            recolored_rgb_int, _, gamut_pixels, psnr, _, delta_e_stats = self._compute_full_resolution_render()
+            export_dither_strength = self.dither_strength
+            if self.export_dither_checkbox is not None and not self.export_dither_checkbox.isChecked():
+                export_dither_strength = 0.0
+            recolored_rgb_int, _, gamut_pixels, psnr, _, delta_e_stats = self._compute_full_resolution_render(
+                dither_strength=export_dither_strength,
+            )
             save_luma_output_image(recolored_rgb_int, output_path)
         except Exception as exc:  # noqa: BLE001
             self._show_error("Export Image Failed", str(exc))
             return
 
         self.status_label.setText(
-            "Exported image: {}  gamut={}  PSNR={:.2f} dB  DeltaE mean={:.2f}"
-            .format(output_path, gamut_pixels, psnr, delta_e_stats["mean"])
+            "Exported image: {}  dither={}  gamut={}  PSNR={:.2f} dB  DeltaE mean={:.2f}"
+            .format(
+                output_path,
+                "on" if export_dither_strength > 0.0 else "off",
+                gamut_pixels,
+                psnr,
+                delta_e_stats["mean"],
+            )
         )
 
     def _render_full_resolution(self):
@@ -2433,11 +2451,11 @@ class QtEditorLauncherWindow(QtWidgets.QWidget):
         alpha_mask_path: str | None = None,
         curve_path: str | None = None,
         curve_output_path: str | None = None,
-        dither_strength: float = DITHER_STRENGTH,
+        dither_strength: float | None = DITHER_STRENGTH,
     ):
         super().__init__()
         self.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose, True)
-        self.dither_strength = float(dither_strength)
+        self.dither_strength = dither_strength
         self._mask_seed_points: list[tuple[int, int]] = []
         self._opened_editors: list[QtOklchCurveEditorWindow] = []
         self._build_ui()
@@ -2958,7 +2976,7 @@ def build_qt_editor(
     mask_region_offset: int = 0,
     curve_path: str | None = None,
     curve_output_path: str | None = None,
-    dither_strength: float = DITHER_STRENGTH,
+    dither_strength: float | None = DITHER_STRENGTH,
 ) -> QtOklchCurveEditorWindow:
     """Construct the Qt MVP editor without starting the Qt event loop."""
     app, _ = _ensure_qt_application()
@@ -2974,6 +2992,7 @@ def build_qt_editor(
     rgb_float = loaded_image.rgb_float
     oklch_float = loaded_image.oklch_float
     valid_mask = loaded_image.valid_mask
+    resolved_dither_strength, _ = resolve_dither_strength(dither_strength, loaded_image)
     base_model, _ = build_oklch_curve_model(oklch_float, valid_mask)
     curve_overrides = load_state_curve_overrides(curve_path)
     window = QtOklchCurveEditorWindow(
@@ -2983,7 +3002,7 @@ def build_qt_editor(
         valid_mask,
         base_model,
         initial_curve_overrides=curve_overrides,
-        dither_strength=dither_strength,
+        dither_strength=resolved_dither_strength,
         curve_output_path=curve_output_path,
     )
     window._qt_application = app
@@ -3000,7 +3019,7 @@ def build_qt_editor_launcher(
     alpha_mask_path: str | None = None,
     curve_path: str | None = None,
     curve_output_path: str | None = None,
-    dither_strength: float = DITHER_STRENGTH,
+    dither_strength: float | None = DITHER_STRENGTH,
 ) -> QtEditorLauncherWindow:
     """Construct the Qt launcher without starting the event loop."""
     app, _ = _ensure_qt_application()
@@ -3025,7 +3044,7 @@ def launch_qt_editor(
     mask_region_offset: int = 0,
     curve_path: str | None = None,
     curve_output_path: str | None = None,
-    dither_strength: float = DITHER_STRENGTH,
+    dither_strength: float | None = DITHER_STRENGTH,
     run_event_loop: bool = True,
     show_warning_dialogs: bool = True,
 ) -> QtOklchCurveEditorWindow | None:
@@ -3075,7 +3094,7 @@ def launch_qt_editor_launcher(
     alpha_mask_path: str | None = None,
     curve_path: str | None = None,
     curve_output_path: str | None = None,
-    dither_strength: float = DITHER_STRENGTH,
+    dither_strength: float | None = DITHER_STRENGTH,
     run_event_loop: bool = True,
 ) -> QtEditorLauncherWindow:
     """Launch the Qt file-selection launcher and optionally enter the event loop."""

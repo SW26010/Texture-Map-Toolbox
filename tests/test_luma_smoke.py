@@ -44,6 +44,9 @@ class LumaSmokeTests(unittest.TestCase):
         self.assertIsNotNone(result.recolored_rgb_int)
         self.assertIsNotNone(result.psnr)
         self.assertEqual(result.source_image_shape, result.output_image_shape)
+        self.assertEqual(result.dither_strength_source, "auto-half-input-step")
+        self.assertIsNotNone(result.input_quantization_step)
+        self.assertAlmostEqual(result.dither_strength, 0.5 * result.input_quantization_step)
 
     def test_fast_workflow_runs(self):
         result = run_luma_workflow(
@@ -95,6 +98,8 @@ class LumaSmokeTests(unittest.TestCase):
             payload = json.loads(result_json.read_text(encoding="utf-8"))
             self.assertEqual(payload["algorithm"], "original")
             self.assertIn("psnr", payload)
+            self.assertIn("input_quantization_step", payload)
+            self.assertEqual(payload["dither_strength_source"], "auto-half-input-step")
 
     def test_cli_request_json_runs_fast_workflow(self):
         with tempfile.TemporaryDirectory() as temp_dir:
